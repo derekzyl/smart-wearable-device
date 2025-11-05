@@ -24,9 +24,9 @@
 #include <ESP32Time.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
-#include "MAX30105.h"
+#include <MAX30105.h>  // From SparkFun library
 #include "heartRate.h"
-#include "Adafruit_MPU6050.h"
+#include <Adafruit_MPU6050.h>
 #include "MAX30205.h"
 
 // ==================== Hardware Pin Definitions ====================

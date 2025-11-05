@@ -167,30 +167,6 @@ See [Hardware Component List](#hardware-components) for complete BOM.
 
 See [Backend README](backend-api/README.md) for complete API documentation.
 
-## 🛠️ Development Timeline
-
-| Phase | Duration | Status |
-|-------|----------|--------|
-| Hardware prototyping | 2-3 weeks | ✅ Complete |
-| Firmware development | 3-4 weeks | 🔄 In Progress |
-| Flutter app (MVP) | 4-5 weeks | 🔄 In Progress |
-| FastAPI backend | 3-4 weeks | 🔄 In Progress |
-| ML model training | 2-3 weeks | ⏳ Pending |
-| Integration testing | 2 weeks | ⏳ Pending |
-
-## 💰 Estimated Costs
-
-| Category | Cost (USD) |
-|----------|-----------|
-| ESP32-S3 module | $5-8 |
-| Sensors (MAX30102, MPU6050, MAX30205) | $15-20 |
-| Display + battery + charger | $10-15 |
-| PCB fabrication (5 pcs) | $20-30 |
-| Enclosure (3D print) + band | $15-25 |
-| Misc. components | $10 |
-| **Total per unit** | **$75-110** |
-
-*(Bulk manufacturing: $30-50/unit at 1000+ qty)*
 
 ## 🔒 Security & Privacy
 
@@ -219,4 +195,4 @@ For questions or support, please open an issue on GitHub.
 
 **Built with ❤️ for better health monitoring**
 
-# smart-wearable-device
+

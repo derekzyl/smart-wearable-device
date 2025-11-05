@@ -128,7 +128,9 @@ class BLEService extends ChangeNotifier {
               await characteristic.setNotifyValue(true);
               characteristic.onValueReceived.listen((value) {
                 if (value.length >= 2 && _currentVitals != null) {
-                  int16 tempRaw = (value[1] << 8) | value[0];
+                  int tempRaw = (value[1] << 8) | value[0];
+                  // Handle signed int16
+                  if (tempRaw > 32767) tempRaw -= 65536;
                   double temperature = tempRaw / 100.0;
                   _currentVitals = VitalsData(
                     heartRate: _currentVitals!.heartRate,
