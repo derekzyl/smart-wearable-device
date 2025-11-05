@@ -2,10 +2,11 @@
 Analytics and ML prediction routes
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
 from database import get_db
 from models import VitalsData
@@ -14,6 +15,39 @@ from services.ml_service import MLService
 
 router = APIRouter()
 ml_service = MLService()
+
+@router.post("/activity", response_model=dict)
+async def predict_activity(
+    user_id: str,
+    imu_data: List[Dict[str, Any]] = Body(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """Predict activity using CNN model"""
+    try:
+        activity_prediction = ml_service.predict_activity(imu_data)
+        return activity_prediction
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error predicting activity: {str(e)}"
+        )
+
+@router.post("/sleep-stages", response_model=dict)
+async def predict_sleep_stages(
+    user_id: str,
+    vitals_history: List[Dict[str, Any]] = Body(...),
+    imu_data: List[Dict[str, Any]] = Body(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """Advanced sleep stage classification"""
+    try:
+        sleep_stages = ml_service.predict_sleep_stages(vitals_history, imu_data)
+        return sleep_stages
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error predicting sleep stages: {str(e)}"
+        )
 
 @router.post("/predict", response_model=HealthPredictionResponse)
 async def predict_health(

@@ -24,6 +24,8 @@ dependencies = [
     "timescaledb>=1.0.0",
     "httpx>=0.25.0",
     "python-dotenv>=1.0.0",
+    "reportlab>=4.0.0",
+    "websockets>=12.0",
 ]
 
 [build-system]

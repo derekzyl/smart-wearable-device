@@ -11,7 +11,7 @@ import uvicorn
 from dotenv import load_dotenv
 import os
 
-from routes import vitals, analytics, ratings, auth
+from routes import vitals, analytics, ratings, auth, websocket, export, health_platforms
 from database import init_db, get_db
 from models import Base
 
@@ -49,6 +49,9 @@ app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
 app.include_router(vitals.router, prefix="/api/v1/vitals", tags=["Vitals"])
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
 app.include_router(ratings.router, prefix="/api/v1/ratings", tags=["Ratings"])
+app.include_router(websocket.router, prefix="/api/v1", tags=["WebSocket"])
+app.include_router(export.router, prefix="/api/v1/export", tags=["Export"])
+app.include_router(health_platforms.router, prefix="/api/v1", tags=["Health Platforms"])
 
 @app.get("/")
 async def root():

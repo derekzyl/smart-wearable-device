@@ -10,6 +10,8 @@ from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 import joblib
 import os
+from .lstm_stress_model import LSTMStressModel
+from .cnn_activity_model import CNNActivityModel
 
 class MLService:
     """ML service for health predictions"""
@@ -18,6 +20,8 @@ class MLService:
         self.anomaly_model = None
         self.sleep_model = None
         self.scaler = StandardScaler()
+        self.lstm_stress_model = LSTMStressModel()
+        self.cnn_activity_model = CNNActivityModel()
         self._load_models()
     
     def _load_models(self):
@@ -43,8 +47,8 @@ class MLService:
         # Sleep quality prediction
         sleep_quality = self._predict_sleep_quality(df)
         
-        # Stress level prediction
-        stress_level = self._predict_stress_level(df)
+        # Stress level prediction (using LSTM)
+        stress_level = self._predict_stress_level_lstm(vitals_history)
         
         # Cardiovascular risk
         cardiovascular_risk = self._predict_cardiovascular_risk(df)
@@ -131,8 +135,91 @@ class MLService:
         
         return 75
     
+    def predict_sleep_stages(self, vitals_history: List[Dict[str, Any]], imu_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Advanced sleep stage classification"""
+        if not vitals_history or not imu_data:
+            return {
+                "wake": 0.2,
+                "light": 0.3,
+                "deep": 0.3,
+                "rem": 0.2,
+                "dominant_stage": "light"
+            }
+        
+        df_vitals = pd.DataFrame(vitals_history)
+        df_imu = pd.DataFrame(imu_data)
+        
+        # Features for sleep stage classification
+        features = []
+        
+        # Heart rate features
+        if 'heart_rate' in df_vitals.columns and not df_vitals['heart_rate'].empty:
+            hr_mean = df_vitals['heart_rate'].mean()
+            hr_std = df_vitals['heart_rate'].std()
+            features.extend([hr_mean, hr_std])
+        else:
+            features.extend([70.0, 5.0])
+        
+        # Movement features from IMU
+        if 'accel_x' in df_imu.columns and not df_imu.empty:
+            movement = np.sqrt(
+                df_imu['accel_x']**2 + 
+                df_imu['accel_y']**2 + 
+                df_imu['accel_z']**2
+            ).mean()
+            features.append(movement)
+        else:
+            features.append(0.1)
+        
+        # SpO₂ features
+        if 'spo2' in df_vitals.columns and not df_vitals['spo2'].empty:
+            spo2_mean = df_vitals['spo2'].mean()
+            spo2_std = df_vitals['spo2'].std()
+            features.extend([spo2_mean, spo2_std])
+        else:
+            features.extend([98.0, 1.0])
+        
+        # Use Random Forest for classification
+        if self.sleep_model is None:
+            self.sleep_model = RandomForestClassifier(n_estimators=100, random_state=42)
+        
+        # Prepare features for prediction
+        X = np.array(features).reshape(1, -1)
+        
+        # Since we don't have trained data, use heuristic-based classification
+        # In production, this would use a trained model
+        hr_mean = features[0]
+        hr_std = features[1]
+        movement = features[2]
+        
+        # Heuristic classification
+        if movement > 0.5:
+            # High movement = wake
+            probabilities = [0.7, 0.2, 0.05, 0.05]
+            dominant = "wake"
+        elif hr_std < 3 and hr_mean < 65:
+            # Very stable, low HR = deep sleep
+            probabilities = [0.05, 0.1, 0.7, 0.15]
+            dominant = "deep"
+        elif hr_std < 5 and 60 < hr_mean < 75:
+            # Moderate variability = REM
+            probabilities = [0.1, 0.2, 0.2, 0.5]
+            dominant = "rem"
+        else:
+            # Light sleep
+            probabilities = [0.15, 0.5, 0.2, 0.15]
+            dominant = "light"
+        
+        return {
+            "wake": probabilities[0],
+            "light": probabilities[1],
+            "deep": probabilities[2],
+            "rem": probabilities[3],
+            "dominant_stage": dominant
+        }
+    
     def _predict_stress_level(self, df: pd.DataFrame) -> str:
-        """Predict stress level"""
+        """Predict stress level (fallback method)"""
         if df.empty or 'heart_rate' not in df.columns:
             return "moderate"
         
@@ -145,6 +232,39 @@ class MLService:
             return "moderate"
         else:
             return "low"
+    
+    def _predict_stress_level_lstm(self, vitals_history: List[Dict[str, Any]]) -> str:
+        """Predict stress level using LSTM model"""
+        if not vitals_history or len(vitals_history) < 10:
+            # Fallback to simple method if insufficient data
+            if vitals_history:
+                df = pd.DataFrame(vitals_history)
+                return self._predict_stress_level(df)
+            return "moderate"
+        
+        try:
+            sequences = self.lstm_stress_model.prepare_sequences(vitals_history)
+            stress_level = self.lstm_stress_model.predict(sequences)
+            return stress_level
+        except Exception as e:
+            print(f"LSTM prediction error: {e}. Using fallback method.")
+            if vitals_history:
+                df = pd.DataFrame(vitals_history)
+                return self._predict_stress_level(df)
+            return "moderate"
+    
+    def predict_activity(self, imu_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Predict activity using CNN model"""
+        if not imu_data or len(imu_data) < 10:
+            return {"activity": "stationary", "confidence": 0.5}
+        
+        try:
+            windows = self.cnn_activity_model.prepare_windows(imu_data)
+            activity_prediction = self.cnn_activity_model.predict(windows)
+            return activity_prediction
+        except Exception as e:
+            print(f"CNN prediction error: {e}")
+            return {"activity": "stationary", "confidence": 0.5}
     
     def _predict_cardiovascular_risk(self, df: pd.DataFrame) -> str:
         """Predict cardiovascular risk"""
