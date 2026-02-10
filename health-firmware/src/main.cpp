@@ -1,604 +1,770 @@
 /**
- * Smart Health Watch - ESP32-S3 Firmware
+ * Multi-Vitals Health Monitoring System
+ * ESP32 Firmware for HR, SpO2, and Temperature Monitoring
  * 
- * Main firmware for wearable health monitoring device
  * Features:
- * - Heart rate & SpO₂ monitoring (MAX30102)
- * - Body temperature sensing (MAX30205)
- * - Motion tracking (MPU6050 IMU)
- * - OLED display (SSD1306)
- * - Bluetooth Low Energy (BLE) data streaming
- * - Wi-Fi sync to backend API
- * - Low-power deep sleep modes
+ * - Heart Rate monitoring from Sen-11574 PPG sensor
+ * - SpO2 (blood oxygen) monitoring from Sen-11574
+ * - Temperature with DS18B20 failover to Liebermeister's Rule
+ * - 20x4 LCD display with 4 screens
+ * - WiFi cloud sync to /health/vitals endpoint
+ * - Critical alert LED system
+ * - Battery monitoring
  */
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <ESP32Time.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_GFX.h>
-#include <MAX30105.h>  // From SparkFun library
-#include "heartRate.h"
-#include <Adafruit_MPU6050.h>
-#include "MAX30205.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
 
-// ==================== Hardware Pin Definitions ====================
-#define I2C_SDA 21
-#define I2C_SCL 22
-#define OLED_RESET -1
-#define BUTTON_1 0
-#define BUTTON_2 35
-#define VIBRATION_MOTOR 25
-#define CHARGING_LED 26
-#define STATUS_LED 27
+// ==================== PIN DEFINITIONS ====================
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define DS18B20_PIN 4
+#define SEN11574_PIN 34        // ADC1_CH6
+#define BATTERY_ADC_PIN 35     // ADC1_CH7
+#define STATUS_LED 2           // Built-in LED
+#define ALERT_LED 5            // External Red LED
 
-// ==================== Display Configuration ====================
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
+// ==================== CONFIGURATION ====================
+const char* WIFI_SSID = "cybergenii";
+const char* WIFI_PASSWORD = "12341234";
+String API_BASE_URL = "https://xenophobic-netta-cybergenii-1584fde7.koyeb.app";
+const char* VITALS_ENDPOINT = "/health/vitals";
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// ==================== HARDWARE OBJECTS ====================
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature dallas(&oneWire);
+LiquidCrystal_I2C lcd(0x27, 20, 4);  // Try 0x3F if 0x27 doesn't work
+Preferences preferences;
 
-// ==================== Sensor Objects ====================
-MAX30105 particleSensor;
-Adafruit_MPU6050 mpu;
-MAX30205 tempSensor;
+// ==================== GLOBAL VARIABLES ====================
+String deviceID;
+int currentScreen = 0;
+unsigned long lastScreenChange = 0;
+bool manualScreenLock = false;
 
-// ==================== BLE Configuration ====================
-#define SERVICE_UUID "12345678-1234-1234-1234-123456789abc"
-#define CHAR_HEART_RATE_UUID "00002a37-0000-1000-8000-00805f9b34fb"
-#define CHAR_SPO2_UUID "12345678-1234-1234-1234-123456789abd"
-#define CHAR_TEMPERATURE_UUID "12345678-1234-1234-1234-123456789abe"
-#define CHAR_IMU_UUID "12345678-1234-1234-1234-123456789abf"
-#define CHAR_BATTERY_UUID "00002a19-0000-1000-8000-00805f9b34fb"
-
-BLEServer* pServer = nullptr;
-BLECharacteristic* pCharHeartRate = nullptr;
-BLECharacteristic* pCharSpO2 = nullptr;
-BLECharacteristic* pCharTemperature = nullptr;
-BLECharacteristic* pCharIMU = nullptr;
-BLECharacteristic* pCharBattery = nullptr;
-
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
-
-// ==================== Sensor Data Structures ====================
-struct VitalsData {
-  float heartRate = 0.0;
-  float spo2 = 0.0;
-  float temperature = 0.0;
-  float batteryLevel = 100.0;
-  uint32_t timestamp = 0;
-};
-
-struct IMUData {
-  float accelX = 0.0;
-  float accelY = 0.0;
-  float accelZ = 0.0;
-  float gyroX = 0.0;
-  float gyroY = 0.0;
-  float gyroZ = 0.0;
-  uint32_t steps = 0;
-};
-
-VitalsData vitals;
-IMUData imuData;
-
-// ==================== Heart Rate Calculation ====================
-const byte RATE_SIZE = 4;
-byte rates[RATE_SIZE];
-byte rateSpot = 0;
-long lastBeat = 0;
-float beatsPerMinute = 0;
-int beatAvg = 0;
-
-// ==================== Wi-Fi Configuration ====================
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-const char* backendUrl = "http://your-backend-api.com/api/v1/vitals/upload";
-
-// ==================== Power Management ====================
-const unsigned long DEEP_SLEEP_INTERVAL = 15 * 60 * 1000; // 15 minutes
-unsigned long lastSyncTime = 0;
-unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_UPDATE_INTERVAL = 1000; // 1 second
-
-// ==================== RTC ====================
-ESP32Time rtc;
-
-// ==================== BLE Server Callbacks ====================
-class MyServerCallbacks: public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
-    deviceConnected = true;
-    digitalWrite(STATUS_LED, HIGH);
-  }
-
-  void onDisconnect(BLEServer* pServer) {
-    deviceConnected = false;
-    digitalWrite(STATUS_LED, LOW);
-  }
-};
-
-// ==================== Function Prototypes ====================
-void initSensors();
-void initDisplay();
-void initBLE();
-void initWiFi();
-void updateHeartRate();
-void updateSpO2();
-void updateTemperature();
-void updateIMU();
-void updateDisplay();
-void sendBLEData();
-void syncToBackend();
-float readBatteryLevel();
-void vibrate(int duration);
-void enterDeepSleep();
-
-// ==================== Setup ====================
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-
-  // Initialize pins
-  pinMode(BUTTON_1, INPUT_PULLUP);
-  pinMode(BUTTON_2, INPUT_PULLUP);
-  pinMode(VIBRATION_MOTOR, OUTPUT);
-  pinMode(CHARGING_LED, OUTPUT);
-  pinMode(STATUS_LED, OUTPUT);
-
-  // Initialize I2C
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000); // Fast I2C (400kHz)
-
-  // Initialize sensors
-  initSensors();
-  
-  // Initialize display
-  initDisplay();
-  
-  // Initialize BLE
-  initBLE();
-  
-  // Initialize WiFi (optional, for backend sync)
-  // initWiFi();
-
-  // Initialize RTC
-  rtc.setTime(0); // Will be synced from backend/NTP
-
-  Serial.println("Smart Health Watch initialized!");
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(10, 20);
-  display.println("Health Watch");
-  display.setTextSize(1);
-  display.setCursor(20, 45);
-  display.println("Initializing...");
-  display.display();
-  delay(2000);
-}
-
-// ==================== Main Loop ====================
-void loop() {
-  unsigned long currentMillis = millis();
-
-  // Update sensors
-  updateHeartRate();
-  updateSpO2();
-  updateTemperature();
-  updateIMU();
-  readBatteryLevel();
-
-  // Update display
-  if (currentMillis - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
-    updateDisplay();
-    lastDisplayUpdate = currentMillis;
-  }
-
-  // Send BLE data if connected
-  if (deviceConnected) {
-    sendBLEData();
-  }
-
-  // Handle BLE connection state
-  if (!deviceConnected && oldDeviceConnected) {
-    delay(500);
-    pServer->startAdvertising();
-    oldDeviceConnected = deviceConnected;
-  }
-  if (deviceConnected && !oldDeviceConnected) {
-    oldDeviceConnected = deviceConnected;
-  }
-
-  // Sync to backend periodically (every 15 minutes)
-  if (WiFi.status() == WL_CONNECTED && 
-      (currentMillis - lastSyncTime >= DEEP_SLEEP_INTERVAL || lastSyncTime == 0)) {
-    syncToBackend();
-    lastSyncTime = currentMillis;
-  }
-
-  // Check for abnormal readings and trigger alerts
-  if (vitals.heartRate > 120 || vitals.heartRate < 50) {
-    vibrate(200);
-  }
-  if (vitals.spo2 < 90) {
-    vibrate(500);
-  }
-  if (vitals.temperature > 38.0 || vitals.temperature < 35.0) {
-    vibrate(300);
-  }
-
-  // Button handling
-  if (digitalRead(BUTTON_1) == LOW) {
-    // Toggle display mode
-    delay(200); // Debounce
-  }
-
-  delay(100); // Small delay for stability
-}
-
-// ==================== Initialize Sensors ====================
-void initSensors() {
-  Serial.println("Initializing sensors...");
-
-  // MAX30102 Heart Rate & SpO₂ Sensor
-  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
-    Serial.println("MAX30102 not found. Please check wiring/power.");
-    while (1);
-  }
-  particleSensor.setup();
-  particleSensor.setPulseAmplitudeRed(0x0A);
-  particleSensor.setPulseAmplitudeGreen(0);
-  Serial.println("MAX30102 initialized");
-
-  // MPU6050 IMU
-  if (!mpu.begin()) {
-    Serial.println("MPU6050 not found. Please check wiring.");
-    while (1);
-  }
-  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
-  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  Serial.println("MPU6050 initialized");
-
-  // MAX30205 Temperature Sensor
-  if (!tempSensor.begin()) {
-    Serial.println("MAX30205 not found. Please check wiring.");
-    while (1);
-  }
-  Serial.println("MAX30205 initialized");
-}
-
-// ==================== Initialize Display ====================
-void initDisplay() {
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("SSD1306 allocation failed");
-    for (;;);
-  }
-  display.clearDisplay();
-  display.display();
-  Serial.println("OLED display initialized");
-}
-
-// ==================== Initialize BLE ====================
-void initBLE() {
-  BLEDevice::init("Smart Health Watch");
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  BLEService* pService = pServer->createService(SERVICE_UUID);
-
-  // Heart Rate Characteristic
-  pCharHeartRate = pService->createCharacteristic(
-    CHAR_HEART_RATE_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pCharHeartRate->addDescriptor(new BLE2902());
-
-  // SpO₂ Characteristic
-  pCharSpO2 = pService->createCharacteristic(
-    CHAR_SPO2_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pCharSpO2->addDescriptor(new BLE2902());
-
-  // Temperature Characteristic
-  pCharTemperature = pService->createCharacteristic(
-    CHAR_TEMPERATURE_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pCharTemperature->addDescriptor(new BLE2902());
-
-  // IMU Data Characteristic
-  pCharIMU = pService->createCharacteristic(
-    CHAR_IMU_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pCharIMU->addDescriptor(new BLE2902());
-
-  // Battery Level Characteristic
-  pCharBattery = pService->createCharacteristic(
-    CHAR_BATTERY_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pCharBattery->addDescriptor(new BLE2902());
-
-  pService->start();
-  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);
-  pAdvertising->setMinPreferred(0x12);
-  BLEDevice::startAdvertising();
-  Serial.println("BLE initialized - Waiting for client connection...");
-}
-
-// ==================== Initialize WiFi ====================
-void initWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\nWiFi connection failed. Continuing with BLE only.");
-  }
-}
-
-// ==================== Update Heart Rate ====================
-void updateHeartRate() {
-  long irValue = particleSensor.getIR();
-  
-  if (checkForBeat(irValue) == true) {
-    long delta = millis() - lastBeat;
-    lastBeat = millis();
-    beatsPerMinute = 60 / (delta / 1000.0);
+// ==================== VITAL SIGNS STRUCTURE ====================
+struct VitalSigns {
+    int heartRate = 0;
+    int hrQuality = 0;
+    int spo2 = 0;
+    int spo2Quality = 0;
+    float temperature = 36.5;
+    bool tempEstimated = false;
+    String tempSource = "UNKNOWN";
+    int batteryPercent = 100;
+    float batteryVoltage = 3.7;
     
-    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
-      rates[rateSpot++] = (byte)beatsPerMinute;
-      rateSpot %= RATE_SIZE;
-      
-      beatAvg = 0;
-      for (byte x = 0; x < RATE_SIZE; x++) {
-        beatAvg += rates[x];
-      }
-      beatAvg /= RATE_SIZE;
+    bool hasAlert = false;
+    String alertMessage = "";
+    bool isCriticalAlert = false;
+};
+
+VitalSigns currentVitals;
+
+// ==================== PULSE SENSOR CLASS (SEN-11574) ====================
+class PulseSensor {
+private:
+    static const int SAMPLE_RATE = 500;  // Hz
+    static const int WINDOW_SIZE = 100;   // samples (~200ms window)
+    
+    int signalBuffer[WINDOW_SIZE];
+    int bufferIndex = 0;
+    
+    unsigned long lastBeatTime = 0;
+    int bpm = 0;
+    int rrIntervals[10];
+    int rrIndex = 0;
+    
+    float dcComponent = 0;
+    float acComponent = 0;
+    float spo2 = 0;
+    
+    int signalQuality = 0;
+    int threshold = 2000;
+    
+    unsigned long lastSampleTime = 0;
+    
+public:
+    void begin() {
+        pinMode(SEN11574_PIN, INPUT);
+        for (int i = 0; i < WINDOW_SIZE; i++) {
+            signalBuffer[i] = 0;
+        }
     }
-  }
-  
-  vitals.heartRate = beatsPerMinute > 20 ? beatsPerMinute : beatAvg;
-  vitals.timestamp = rtc.getEpoch();
-}
-
-// ==================== Update SpO₂ ====================
-void updateSpO2() {
-  long redValue = particleSensor.getRed();
-  long irValue = particleSensor.getIR();
-  
-  // Simple SpO₂ calculation (simplified algorithm)
-  // Real implementation would use more sophisticated PPG analysis
-  float ratio = (float)redValue / (float)irValue;
-  vitals.spo2 = 110.0 - 25.0 * ratio;
-  
-  // Clamp to valid range
-  if (vitals.spo2 > 100) vitals.spo2 = 100;
-  if (vitals.spo2 < 70) vitals.spo2 = 95; // Default if invalid
-}
-
-// ==================== Update Temperature ====================
-void updateTemperature() {
-  vitals.temperature = tempSensor.getTemperature();
-}
-
-// ==================== Update IMU ====================
-void updateIMU() {
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-  
-  imuData.accelX = a.acceleration.x;
-  imuData.accelY = a.acceleration.y;
-  imuData.accelZ = a.acceleration.z;
-  imuData.gyroX = g.gyro.x;
-  imuData.gyroY = g.gyro.y;
-  imuData.gyroZ = g.gyro.z;
-  
-  // Simple step detection (magnitude threshold)
-  float magnitude = sqrt(a.acceleration.x*a.acceleration.x + 
-                         a.acceleration.y*a.acceleration.y + 
-                         a.acceleration.z*a.acceleration.z);
-  static float lastMagnitude = 0;
-  static unsigned long lastStepTime = 0;
-  
-  if (abs(magnitude - lastMagnitude) > 2.0 && 
-      (millis() - lastStepTime) > 300) {
-    imuData.steps++;
-    lastStepTime = millis();
-  }
-  lastMagnitude = magnitude;
-}
-
-// ==================== Update Display ====================
-void updateDisplay() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  
-  // Heart Rate
-  display.setCursor(0, 0);
-  display.print("HR: ");
-  display.print((int)vitals.heartRate);
-  display.println(" bpm");
-  
-  // SpO₂
-  display.setCursor(0, 12);
-  display.print("SpO2: ");
-  display.print((int)vitals.spo2);
-  display.println("%");
-  
-  // Temperature
-  display.setCursor(0, 24);
-  display.print("Temp: ");
-  display.print(vitals.temperature, 1);
-  display.println(" C");
-  
-  // Steps
-  display.setCursor(0, 36);
-  display.print("Steps: ");
-  display.println(imuData.steps);
-  
-  // Battery
-  display.setCursor(0, 48);
-  display.print("Battery: ");
-  display.print((int)vitals.batteryLevel);
-  display.println("%");
-  
-  // Connection status
-  display.setCursor(90, 0);
-  if (deviceConnected) {
-    display.println("BLE");
-  } else {
-    display.println("---");
-  }
-  
-  display.display();
-}
-
-// ==================== Send BLE Data ====================
-void sendBLEData() {
-  if (deviceConnected) {
-    // Heart Rate
-    uint8_t hrData[2] = {(uint8_t)vitals.heartRate, 0};
-    pCharHeartRate->setValue(hrData, 2);
-    pCharHeartRate->notify();
     
-    // SpO₂
-    uint8_t spo2Data[1] = {(uint8_t)vitals.spo2};
-    pCharSpO2->setValue(spo2Data, 1);
-    pCharSpO2->notify();
+    void update() {
+        // Sample at 500Hz (every 2ms)
+        unsigned long now = millis();
+        if (now - lastSampleTime < 2) return;
+        lastSampleTime = now;
+        
+        // Read analog value (0-4095 on ESP32)
+        int rawSignal = analogRead(SEN11574_PIN);
+        
+        // Store in circular buffer
+        signalBuffer[bufferIndex] = rawSignal;
+        bufferIndex = (bufferIndex + 1) % WINDOW_SIZE;
+        
+        // Detect heartbeat
+        detectBeat(rawSignal);
+        
+        // Calculate SpO2
+        calculateSpO2(rawSignal);
+        
+        // Update signal quality
+        updateSignalQuality();
+    }
     
-    // Temperature
-    uint8_t tempData[2];
-    int16_t tempInt = (int16_t)(vitals.temperature * 100);
-    tempData[0] = (uint8_t)(tempInt & 0xFF);
-    tempData[1] = (uint8_t)((tempInt >> 8) & 0xFF);
-    pCharTemperature->setValue(tempData, 2);
-    pCharTemperature->notify();
+    void detectBeat(int signal) {
+        static int lastSignal = 0;
+        static bool risingEdge = false;
+        
+        // Peak detection
+        if (signal > threshold && lastSignal <= threshold) {
+            risingEdge = true;
+        }
+        
+        if (risingEdge && signal < threshold) {
+            // Beat detected!
+            unsigned long now = millis();
+            unsigned long beatInterval = now - lastBeatTime;
+            
+            // Validate (30-200 BPM range = 300-2000ms interval)
+            if (beatInterval > 300 && beatInterval < 2000 && lastBeatTime > 0) {
+                bpm = 60000 / beatInterval;
+                
+                // Store RR interval for HRV
+                rrIntervals[rrIndex] = beatInterval;
+                rrIndex = (rrIndex + 1) % 10;
+                
+                lastBeatTime = now;
+            } else if (lastBeatTime == 0) {
+                lastBeatTime = now;
+            }
+            
+            risingEdge = false;
+        }
+        
+        lastSignal = signal;
+        
+        // Auto-adjust threshold every second
+        static unsigned long lastThresholdUpdate = 0;
+        if (millis() - lastThresholdUpdate > 1000) {
+            adjustThreshold();
+            lastThresholdUpdate = millis();
+        }
+    }
     
-    // IMU Data (JSON format)
-    StaticJsonDocument<200> doc;
-    doc["ax"] = imuData.accelX;
-    doc["ay"] = imuData.accelY;
-    doc["az"] = imuData.accelZ;
-    doc["gx"] = imuData.gyroX;
-    doc["gy"] = imuData.gyroY;
-    doc["gz"] = imuData.gyroZ;
-    doc["steps"] = imuData.steps;
-    String imuJson;
-    serializeJson(doc, imuJson);
-    pCharIMU->setValue(imuJson.c_str());
-    pCharIMU->notify();
+    void adjustThreshold() {
+        // Find min/max in buffer
+        int minVal = 4095, maxVal = 0;
+        for (int i = 0; i < WINDOW_SIZE; i++) {
+            if (signalBuffer[i] < minVal) minVal = signalBuffer[i];
+            if (signalBuffer[i] > maxVal) maxVal = signalBuffer[i];
+        }
+        // Set threshold at 70% of range
+        threshold = minVal + (maxVal - minVal) * 0.7;
+    }
     
-    // Battery Level
-    uint8_t batteryData[1] = {(uint8_t)vitals.batteryLevel};
-    pCharBattery->setValue(batteryData, 1);
-    pCharBattery->notify();
+    void calculateSpO2(int signal) {
+        // SpO2 estimation from single-wavelength PPG
+        // Note: This is an approximation - dual-wavelength is more accurate
+        
+        // Calculate DC component (baseline) with low-pass filter
+        static float dcFilter = 2000;
+        dcFilter = dcFilter * 0.95 + signal * 0.05;
+        dcComponent = dcFilter;
+        
+        // Calculate AC component (pulsatile)
+        acComponent = signal - dcComponent;
+        
+        // Calculate AC/DC ratio
+        if (dcComponent > 100) {  // Avoid division by zero
+            float ratio = abs(acComponent) / dcComponent;
+            
+            // Empirical formula for SpO2 estimation
+            // This is a simplified model - adjust based on calibration
+            spo2 = 110 - 25 * ratio;
+            
+            // Clamp to valid range
+            if (spo2 > 100) spo2 = 100;
+            if (spo2 < 70) spo2 = 70;
+        } else {
+            spo2 = 0;  // Invalid reading
+        }
+    }
     
-    delay(10); // Small delay to prevent BLE buffer overflow
-  }
+    void updateSignalQuality() {
+        // Calculate signal quality based on:
+        // 1. Signal amplitude
+        // 2. Consistency of beats
+        // 3. Noise level
+        
+        int minVal = 4095, maxVal = 0;
+        for (int i = 0; i < WINDOW_SIZE; i++) {
+            if (signalBuffer[i] < minVal) minVal = signalBuffer[i];
+            if (signalBuffer[i] > maxVal) maxVal = signalBuffer[i];
+        }
+        int amplitude = maxVal - minVal;
+        
+        // Quality score based on amplitude
+        if (amplitude > 1000) {
+            signalQuality = 95;
+        } else if (amplitude > 500) {
+            signalQuality = 75;
+        } else if (amplitude > 200) {
+            signalQuality = 50;
+        } else {
+            signalQuality = 25;
+        }
+        
+        // Reduce quality if no recent beats
+        if (millis() - lastBeatTime > 3000) {
+            signalQuality = 0;
+            bpm = 0;  // Invalidate BPM
+        }
+    }
+    
+    int getBPM() {
+        // Return 0 if no beat in last 3 seconds
+        if (millis() - lastBeatTime > 3000) {
+            return 0;
+        }
+        return bpm;
+    }
+    
+    int getSpO2() {
+        // Return SpO2 percentage
+        if (signalQuality < 50) {
+            return 0;  // Signal too poor for reliable SpO2
+        }
+        return (int)spo2;
+    }
+    
+    int getSignalQuality() {
+        return signalQuality;
+    }
+    
+    int getSpO2Quality() {
+        // SpO2 needs higher quality signal than HR
+        if (signalQuality > 70) return 90;
+        if (signalQuality > 50) return 60;
+        return 30;
+    }
+    
+    bool isValidReading() {
+        return signalQuality > 50 && (millis() - lastBeatTime < 3000);
+    }
+};
+
+// ==================== TEMPERATURE SENSOR CLASS ====================
+class TemperatureSensor {
+private:
+    DallasTemperature& ds18b20;
+    bool sensorAvailable = true;
+    unsigned long lastCheck = 0;
+    float restingHR = 70.0;
+    
+public:
+    TemperatureSensor(DallasTemperature& sensor) : ds18b20(sensor) {}
+    
+    void begin() {
+        ds18b20.begin();
+        // Load resting HR from preferences
+        restingHR = preferences.getFloat("resting_hr", 70.0);
+    }
+    
+    struct TempReading {
+        float celsius;
+        bool isEstimated;
+        String source;
+    };
+    
+    TempReading getTemperature(float currentHR) {
+        TempReading result;
+        
+        // Try DS18B20 every 10 seconds
+        if (millis() - lastCheck > 10000 || lastCheck == 0) {
+            ds18b20.requestTemperatures();
+            delay(100);  // Wait for conversion
+            float temp = ds18b20.getTempCByIndex(0);
+            
+            // Validate reading
+            if (temp > 30.0 && temp < 45.0 && temp != -127.0) {
+                sensorAvailable = true;
+                result.celsius = temp;
+                result.isEstimated = false;
+                result.source = "DS18B20";
+                lastCheck = millis();
+                return result;
+            } else {
+                sensorAvailable = false;
+            }
+            
+            lastCheck = millis();
+        }
+        
+        // Fallback: Liebermeister's Rule
+        if (!sensorAvailable) {
+            result.celsius = 36.5 + ((currentHR - restingHR) / 10.0);
+            result.isEstimated = true;
+            result.source = "ESTIMATED";
+            
+            // Clamp to reasonable range
+            if (result.celsius < 35.0) result.celsius = 35.0;
+            if (result.celsius > 42.0) result.celsius = 42.0;
+            
+            return result;
+        }
+        
+        // Return last known DS18B20 reading if within 30 seconds
+        if (millis() - lastCheck < 30000) {
+            float temp = ds18b20.getTempCByIndex(0);
+            if (temp > 30.0 && temp < 45.0 && temp != -127.0) {
+                result.celsius = temp;
+                result.isEstimated = false;
+                result.source = "DS18B20";
+                return result;
+            }
+        }
+        
+        // If all else fails, use estimation
+        result.celsius = 36.5 + ((currentHR - restingHR) / 10.0);
+        result.isEstimated = true;
+        result.source = "ESTIMATED";
+        
+        if (result.celsius < 35.0) result.celsius = 35.0;
+        if (result.celsius > 42.0) result.celsius = 42.0;
+        
+        return result;
+    }
+    
+    void setRestingHR(float hr) {
+        restingHR = hr;
+        preferences.putFloat("resting_hr", hr);
+    }
+    
+    bool isSensorAvailable() {
+        return sensorAvailable;
+    }
+};
+
+// ==================== GLOBAL SENSOR INSTANCES ====================
+PulseSensor pulseSensor;
+TemperatureSensor tempSensor(dallas);
+
+// ==================== ALERT CHECKING ====================
+void checkAlerts() {
+    currentVitals.hasAlert = false;
+    currentVitals.isCriticalAlert = false;
+    currentVitals.alertMessage = "";
+    
+    // Priority 1: CRITICAL - Severe Hypoxia (SpO2 < 90%)
+    if (currentVitals.spo2 > 0 && currentVitals.spo2 < 90) {
+        currentVitals.hasAlert = true;
+        currentVitals.isCriticalAlert = true;
+        currentVitals.alertMessage = "CRITICAL: SpO2 LOW!";
+        return;
+    }
+    
+    // Priority 2: No sensor readings
+    if (currentVitals.heartRate == 0) {
+        currentVitals.hasAlert = true;
+        currentVitals.alertMessage = "No HR detected";
+        return;
+    }
+    
+    // Priority 3: WARNING - Low SpO2 (90-94%)
+    if (currentVitals.spo2 > 0 && currentVitals.spo2 < 95) {
+        currentVitals.hasAlert = true;
+        currentVitals.alertMessage = "Low SpO2: " + String(currentVitals.spo2) + "%";
+        return;
+    }
+    
+    // Priority 4: High heart rate
+    if (currentVitals.heartRate > 100) {
+        currentVitals.hasAlert = true;
+        currentVitals.alertMessage = "High HR: " + String(currentVitals.heartRate);
+        return;
+    }
+    
+    // Priority 5: Low heart rate
+    if (currentVitals.heartRate < 50 && currentVitals.heartRate > 0) {
+        currentVitals.hasAlert = true;
+        currentVitals.alertMessage = "Low HR: " + String(currentVitals.heartRate);
+        return;
+    }
+    
+    // Priority 6: High temperature/fever
+    if (currentVitals.temperature > 38.0) {
+        currentVitals.hasAlert = true;
+        currentVitals.alertMessage = "Fever: " + String(currentVitals.temperature, 1) + "C";
+        return;
+    }
+    
+    // Priority 7: Temperature estimation active
+    if (currentVitals.tempEstimated) {
+        currentVitals.hasAlert = true;
+        currentVitals.alertMessage = "Temp Estimated";
+        return;
+    }
+    
+    // Priority 8: Low battery
+    if (currentVitals.batteryPercent < 20) {
+        currentVitals.hasAlert = true;
+        currentVitals.alertMessage = "Low Battery";
+        return;
+    }
 }
 
-// ==================== Sync to Backend ====================
-void syncToBackend() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-  
-  HTTPClient http;
-  http.begin(backendUrl);
-  http.addHeader("Content-Type", "application/json");
-  
-  StaticJsonDocument<512> doc;
-  doc["user_id"] = "device_001"; // Should be configurable
-  doc["timestamp"] = vitals.timestamp;
-  doc["heart_rate"] = vitals.heartRate;
-  doc["spo2"] = vitals.spo2;
-  doc["temperature"] = vitals.temperature;
-  doc["steps"] = imuData.steps;
-  doc["accel_x"] = imuData.accelX;
-  doc["accel_y"] = imuData.accelY;
-  doc["accel_z"] = imuData.accelZ;
-  
-  String jsonString;
-  serializeJson(doc, jsonString);
-  
-  int httpResponseCode = http.POST(jsonString);
-  if (httpResponseCode > 0) {
-    Serial.print("Backend sync successful: ");
-    Serial.println(httpResponseCode);
-  } else {
-    Serial.print("Backend sync failed: ");
-    Serial.println(httpResponseCode);
-  }
-  
-  http.end();
+// ==================== LCD DISPLAY FUNCTIONS ====================
+void updateLCD() {
+    lcd.clear();
+    
+    switch(currentScreen) {
+        case 0: // Main screen - Live vitals
+            lcd.setCursor(0, 0);
+            lcd.print("HR:");
+            lcd.print(currentVitals.heartRate);
+            lcd.print(" BPM ");
+            lcd.print("O2:");
+            lcd.print(currentVitals.spo2);
+            lcd.print("%");
+            
+            lcd.setCursor(0, 1);
+            lcd.print("Temp: ");
+            lcd.print(currentVitals.temperature, 1);
+            lcd.print("C");
+            if (currentVitals.tempEstimated) {
+                lcd.print(" (Est)");
+            }
+            
+            lcd.setCursor(0, 2);
+            lcd.print("Batt: ");
+            lcd.print(currentVitals.batteryPercent);
+            lcd.print("%");
+            lcd.setCursor(10, 2);
+            lcd.print(WiFi.status() == WL_CONNECTED ? "WiFi:Y" : "WiFi:N");
+            
+            lcd.setCursor(0, 3);
+            if (currentVitals.hasAlert) {
+                lcd.print(currentVitals.isCriticalAlert ? "!ALERT! " : "Alert: ");
+                lcd.print(currentVitals.alertMessage.substring(0, 12));
+            } else {
+                lcd.print("Status: Normal");
+            }
+            break;
+            
+        case 1: // Sensor status
+            lcd.setCursor(0, 0);
+            lcd.print("Sensor Status:");
+            
+            lcd.setCursor(0, 1);
+            lcd.print("HR:  ");
+            lcd.print(currentVitals.hrQuality > 50 ? "Good" : "Poor");
+            lcd.print(" (");
+            lcd.print(currentVitals.hrQuality);
+            lcd.print("%)");
+            
+            lcd.setCursor(0, 2);
+            lcd.print("SpO2:");
+            lcd.print(currentVitals.spo2Quality > 50 ? "Good" : "Poor");
+            lcd.print(" (");
+            lcd.print(currentVitals.spo2Quality);
+            lcd.print("%)");
+            
+            lcd.setCursor(0, 3);
+            lcd.print("Temp: ");
+            lcd.print(currentVitals.tempSource);
+            break;
+            
+        case 2: // Alert screen
+            lcd.setCursor(0, 0);
+            lcd.print(currentVitals.isCriticalAlert ? "CRITICAL ALERT!" : "ALERT!");
+            
+            lcd.setCursor(0, 1);
+            lcd.print(currentVitals.alertMessage);
+            
+            lcd.setCursor(0, 2);
+            if (currentVitals.spo2 < 90 && currentVitals.spo2 > 0) {
+                lcd.print("SEEK MEDICAL HELP!");
+            }
+            
+            lcd.setCursor(0, 3);
+            lcd.print("[Auto-rotate 10s]");
+            break;
+            
+        case 3: // Historical summary
+            lcd.setCursor(0, 0);
+            lcd.print("Current Stats:");
+            
+            lcd.setCursor(0, 1);
+            lcd.print("HR: ");
+            lcd.print(currentVitals.heartRate);
+            lcd.print(" BPM");
+            
+            lcd.setCursor(0, 2);
+            lcd.print("SpO2: ");
+            lcd.print(currentVitals.spo2);
+            lcd.print("%");
+            
+            lcd.setCursor(0, 3);
+            lcd.print("Temp: ");
+            lcd.print(currentVitals.temperature, 1);
+            lcd.print("C");
+            break;
+    }
 }
 
-// ==================== Read Battery Level ====================
-float readBatteryLevel() {
-  // Simple voltage divider reading (if battery connected to ADC)
-  // For now, using a placeholder calculation
-  // In real implementation, use ADC pin with voltage divider
-  int adcValue = analogRead(34); // GPIO34 is ADC1_CH6
-  float voltage = (adcValue / 4095.0) * 3.3 * 2; // Assuming 2:1 divider
-  vitals.batteryLevel = ((voltage - 3.0) / 1.2) * 100; // 3.0V = 0%, 4.2V = 100%
-  
-  if (vitals.batteryLevel > 100) vitals.batteryLevel = 100;
-  if (vitals.batteryLevel < 0) vitals.batteryLevel = 0;
-  
-  return vitals.batteryLevel;
+
+// ==================== VITAL SIGNS UPDATE ====================
+void updateVitals() {
+    // Heart rate and SpO2
+    currentVitals.heartRate = pulseSensor.getBPM();
+    currentVitals.hrQuality = pulseSensor.getSignalQuality();
+    currentVitals.spo2 = pulseSensor.getSpO2();
+    currentVitals.spo2Quality = pulseSensor.getSpO2Quality();
+    
+    // Temperature with failover
+    auto tempReading = tempSensor.getTemperature(currentVitals.heartRate);
+    currentVitals.temperature = tempReading.celsius;
+    currentVitals.tempEstimated = tempReading.isEstimated;
+    currentVitals.tempSource = tempReading.source;
+    
+    // Battery
+    int rawBattery = analogRead(BATTERY_ADC_PIN);
+    currentVitals.batteryVoltage = (rawBattery / 4095.0) * 3.3 * 2.0;  // Voltage divider
+    currentVitals.batteryPercent = map((int)(currentVitals.batteryVoltage * 100), 340, 420, 0, 100);
+    currentVitals.batteryPercent = constrain(currentVitals.batteryPercent, 0, 100);
 }
 
-// ==================== Vibrate ====================
-void vibrate(int duration) {
-  digitalWrite(VIBRATION_MOTOR, HIGH);
-  delay(duration);
-  digitalWrite(VIBRATION_MOTOR, LOW);
+// ==================== CLOUD SYNC ====================
+void sendToCloud() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    
+    HTTPClient http;
+    String url = API_BASE_URL + String(VITALS_ENDPOINT);
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    
+    // Build JSON payload
+    StaticJsonDocument<768> doc;
+    doc["device_id"] = deviceID;
+    doc["timestamp"] = millis() / 1000;  // Simple timestamp (should use NTP in production)
+    
+    JsonObject vitals = doc.createNestedObject("vitals");
+    
+    JsonObject hr = vitals.createNestedObject("heart_rate");
+    hr["bpm"] = currentVitals.heartRate;
+    hr["signal_quality"] = currentVitals.hrQuality;
+    hr["is_valid"] = (currentVitals.heartRate > 0);
+    
+    JsonObject spo2 = vitals.createNestedObject("spo2");
+    spo2["percent"] = currentVitals.spo2;
+    spo2["signal_quality"] = currentVitals.spo2Quality;
+    spo2["is_valid"] = (currentVitals.spo2 > 0 && currentVitals.spo2Quality > 50);
+    
+    JsonObject temp = vitals.createNestedObject("temperature");
+    temp["celsius"] = currentVitals.temperature;
+    temp["source"] = currentVitals.tempSource;
+    temp["is_estimated"] = currentVitals.tempEstimated;
+    
+    JsonObject sys = doc.createNestedObject("system");
+    sys["battery_percent"] = currentVitals.batteryPercent;
+    sys["battery_voltage"] = currentVitals.batteryVoltage;
+    sys["wifi_rssi"] = WiFi.RSSI();
+    sys["uptime_seconds"] = millis() / 1000;
+    
+    if (currentVitals.hasAlert) {
+        JsonArray alerts = doc.createNestedArray("alerts");
+        JsonObject alert = alerts.createNestedObject();
+        
+        if (currentVitals.isCriticalAlert) {
+            alert["type"] = "critical_hypoxia";
+        } else if (currentVitals.tempEstimated) {
+            alert["type"] = "temp_estimated";
+        } else {
+            alert["type"] = "threshold_exceeded";
+        }
+        alert["message"] = currentVitals.alertMessage;
+    }
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+    
+    int httpCode = http.POST(jsonString);
+    
+    if (httpCode == 200) {
+        Serial.println("✓ Data sent to /health/vitals");
+        digitalWrite(STATUS_LED, HIGH);
+        delay(50);
+        digitalWrite(STATUS_LED, LOW);
+    } else {
+        Serial.printf("✗ Error sending: %d\n", httpCode);
+    }
+    
+    http.end();
 }
 
-// ==================== Enter Deep Sleep ====================
-void enterDeepSleep() {
-  Serial.println("Entering deep sleep...");
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(10, 30);
-  display.println("Sleeping...");
-  display.display();
-  delay(1000);
-  
-  // Configure wake-up sources
-  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_INTERVAL * 1000); // Convert to microseconds
-  
-  // Enter deep sleep
-  esp_deep_sleep_start();
+// ==================== LED CONTROL ====================
+void updateLEDs() {
+    // Alert LED
+    if (currentVitals.hasAlert) {
+        // Blink faster for critical alerts
+        int blinkRate = currentVitals.isCriticalAlert ? 250 : 500;
+        
+        static unsigned long lastBlink = 0;
+        static bool ledState = false;
+        if (millis() - lastBlink > blinkRate) {
+            ledState = !ledState;
+            digitalWrite(ALERT_LED, ledState);
+            lastBlink = millis();
+        }
+    } else {
+        digitalWrite(ALERT_LED, LOW);
+    }
 }
+
+// ==================== WIFI CONNECTION ====================
+void connectWiFi() {
+    Serial.print("Connecting to WiFi");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nWiFi connection failed");
+    }
+}
+
+// ==================== SCREEN AUTO-ROTATE ====================
+void handleScreenRotation() {
+    if (manualScreenLock) return;
+    
+    // Auto-rotate every 10 seconds
+    if (millis() - lastScreenChange > 10000) {
+        currentScreen = (currentScreen + 1) % 4;
+        lastScreenChange = millis();
+    }
+    
+    // If on alert screen and no alert, skip to next screen
+    if (currentScreen == 2 && !currentVitals.hasAlert) {
+        currentScreen = (currentScreen + 1) % 4;
+    }
+}
+
+// ==================== SETUP ====================
+void setup() {
+    Serial.begin(115200);
+    
+    // Initialize hardware
+    pinMode(STATUS_LED, OUTPUT);
+    pinMode(ALERT_LED, OUTPUT);
+    pinMode(BATTERY_ADC_PIN, INPUT);
+    pinMode(SEN11574_PIN, INPUT);
+    
+    // Configure ADC
+    analogSetAttenuation(ADC_11db);  // 0-3.3V range
+    
+    // LCD
+    Wire.begin(SDA_PIN, SCL_PIN);
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("VitalWatch v2.0");
+    lcd.setCursor(0, 1);
+    lcd.print("HR + SpO2 Monitor");
+    lcd.setCursor(0, 2);
+    lcd.print("Initializing...");
+    
+    // Preferences
+    preferences.begin("health", false);
+    
+    // Generate device ID
+    uint64_t chipid = ESP.getEfuseMac();
+    deviceID = "ESP32_" + String((uint32_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX);
+    deviceID.toUpperCase();
+    
+    // Initialize sensors
+    dallas.begin();
+    tempSensor.begin();
+    pulseSensor.begin();
+    
+    // WiFi
+    lcd.setCursor(0, 3);
+    lcd.print("WiFi connecting...");
+    connectWiFi();
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Ready!");
+    lcd.setCursor(0, 1);
+    lcd.print("Device: ");
+    lcd.print(deviceID.substring(0, 12));
+    delay(2000);
+    
+    lastScreenChange = millis();
+    
+    Serial.println("===== Multi-Vitals Health Monitor =====");
+    Serial.println("Device ID: " + deviceID);
+    Serial.println("Backend: " + API_BASE_URL + VITALS_ENDPOINT);
+    Serial.println("=====================================");
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+    static unsigned long lastSensorRead = 0;
+    static unsigned long lastCloudSync = 0;
+    static unsigned long lastLCDUpdate = 0;
+    static unsigned long lastVitalUpdate = 0;
+    
+    // Read pulse sensor at 500Hz (every 2ms)
+    if (millis() - lastSensorRead >= 2) {
+        pulseSensor.update();
+        lastSensorRead = millis();
+    }
+    
+    // Update vitals every 1 second
+    if (millis() - lastVitalUpdate >= 1000) {
+        updateVitals();
+        checkAlerts();
+        lastVitalUpdate = millis();
+    }
+    
+    // Update LCD every 500ms
+    if (millis() - lastLCDUpdate >= 500) {
+        updateLCD();
+        lastLCDUpdate = millis();
+    }
+    
+    // Cloud sync every 5 seconds
+    if (millis() - lastCloudSync >= 5000 && WiFi.status() == WL_CONNECTED) {
+        sendToCloud();
+        lastCloudSync = millis();
+    }
+    
+    // Handle screen rotation
+    handleScreenRotation();
+    
+    // Update LEDs
+    updateLEDs();
+}
+

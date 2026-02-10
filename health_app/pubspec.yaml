@@ -54,9 +54,6 @@ dependencies:
   # Date/time formatting
   intl: ^0.18.0
   
-  # Icons
-  react_icons: null
-  
   # Path provider for database
   path_provider: ^2.1.0
 

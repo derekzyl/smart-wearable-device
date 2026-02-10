@@ -1,295 +1,259 @@
-# Smart Health Watch - Firmware Documentation
+# Health Monitoring System - ESP32 Firmware
 
 ## Overview
+Complete firmware for multi-vitals health monitoring with heart rate, SpO2, and temperature tracking.
 
-ESP32-S3 firmware for the Smart Health Watch wearable device. This firmware manages all sensor readings, BLE communication, Wi-Fi sync, display updates, and power management.
+## Features
+- ✅ **Heart Rate Monitoring** - Sen-11574 PPG sensor with peak detection (30-200 BPM)
+- ✅ **SpO2 Monitoring** - Blood oxygen saturation from Sen-11574
+- ✅ **Intelligent Temperature Failover** - DS18B20 primary, Liebermeister's Rule fallback
+- ✅ **20x4 LCD Display** - 4 rotating screens (vitals, sensor status, alerts, summary)
+- ✅ **WiFi Cloud Sync** - Sends data to `/health/vitals` every 5 seconds
+- ✅ **Critical Alert System** - Rapid LED blink for SpO2 < 90%
+- ✅ **Battery Monitoring** - Voltage divider on GPIO 35
 
-## Hardware Components
+## Hardware Requirements
 
-### Sensors Integrated
-- **MAX30102** - Heart rate & SpO₂ sensor (PPG)
-- **MAX30205** - Digital temperature sensor (±0.1°C)
-- **MPU6050** - 6-axis IMU (accelerometer + gyroscope)
-- **SSD1306** - 128×64 OLED display
+### Components
+1. ESP32 DevKit V1
+2. Sen-11574 PPG Sensor (analog heart rate + SpO2)
+3. DS18B20 Temperature Sensor (OneWire)
+4. 20x4 I2C LCD Display
+5. 3.7V LiPo Battery + TP4056 Charger
+6. LED (red for alerts)
+7. 4.7kΩ resistor (OneWire pull-up)
+8. 2x 10kΩ resistors (battery voltage divider)
 
-### Communication
-- **Bluetooth Low Energy (BLE)** - Real-time data streaming to mobile app
-- **Wi-Fi** - Periodic sync to FastAPI backend
+### Wiring Diagram
 
-## Pin Configuration
-
-| Pin | Function | Description |
-|-----|----------|-------------|
-| GPIO21 | I2C SDA | I²C data line |
-| GPIO22 | I2C SCL | I²C clock line |
-| GPIO0 | Button 1 | Mode toggle |
-| GPIO35 | Button 2 | Menu navigation |
-| GPIO25 | Vibration Motor | Haptic feedback |
-| GPIO26 | Charging LED | Charging indicator |
-| GPIO27 | Status LED | BLE connection status |
-| GPIO34 | Battery ADC | Battery voltage reading |
-
-## Sensor Functions
-
-### MAX30102 - Heart Rate & SpO₂
-
-**Function**: `updateHeartRate()` and `updateSpO2()`
-
-- Reads IR and Red LED photoplethysmography (PPG) signals
-- Calculates heart rate using peak detection algorithm
-- Estimates SpO₂ using red/IR ratio
-- Sample rate: ~10Hz
-
-**Key Features**:
-- Automatic beat detection
-- Moving average filtering (4-sample window)
-- Valid range: 20-255 BPM
-
-### MAX30205 - Temperature
-
-**Function**: `updateTemperature()`
-
-- Reads digital temperature via I²C
-- Accuracy: ±0.1°C
-- Range: 0°C to 50°C
-- Sample rate: 1Hz
-
-### MPU6050 - Motion Tracking
-
-**Function**: `updateIMU()`
-
-- 6-axis motion sensing (3-axis accel + 3-axis gyro)
-- Accelerometer range: ±2G
-- Gyroscope range: ±250°/s
-- Sample rate: 50Hz
-
-**Features**:
-- Step counting via magnitude threshold
-- Activity detection (walking, running, stationary)
-- Fall detection capability
-
-## BLE Protocol
-
-### Service UUID
 ```
-12345678-1234-1234-1234-123456789abc
+ESP32 GPIO 21 -------- LCD SDA
+ESP32 GPIO 22 -------- LCD SCL
+ESP32 GPIO 4 --------- DS18B20 Data (+ 4.7kΩ pull-up to 3.3V)
+ESP32 GPIO 34 -------- Sen-11574 Signal
+ESP32 GPIO 35 -------- Battery Voltage (via divider)
+ESP32 GPIO 2 --------- Built-in LED (status)
+ESP32 GPIO 5 --------- External Red LED (alerts)
+
+Sen-11574:
+  VIN (+) -------- 3.3V
+  GND (-) -------- GND
+  Signal (S) ----- GPIO 34
+
+DS18B20:
+  VDD (Red) ------ 3.3V
+  GND (Black) ---- GND
+  Data (Yellow) -- GPIO 4
+  4.7kΩ Resistor -- Between Data and VDD
+
+LCD 20x4 I2C:
+  VCC ------------ 5V (or 3.3V depending on module)
+  GND ------------ GND
+  SDA ------------ GPIO 21
+  SCL ------------ GPIO 22
+
+Battery Monitor:
+  Battery+ ------- 10kΩ ------- GPIO 35 ------- 10kΩ ------- GND
 ```
 
-### Characteristics
+## Configuration
 
-| Characteristic | UUID | Type | Data Format |
-|---------------|------|------|-------------|
-| Heart Rate | `00002a37-...` | Notify | uint8_t (BPM) |
-| SpO₂ | `12345678-...789abd` | Notify | uint8_t (%) |
-| Temperature | `12345678-...789abe` | Notify | int16_t (×100, °C) |
-| IMU Data | `12345678-...789abf` | Notify | JSON string |
-| Battery Level | `00002a19-...` | Notify | uint8_t (%) |
-
-### IMU Data JSON Format
-```json
-{
-  "ax": 0.5,
-  "ay": -0.2,
-  "az": 9.8,
-  "gx": 0.01,
-  "gy": 0.02,
-  "gz": -0.01,
-  "steps": 1234
-}
-```
-
-## Power Management
-
-### Operating Modes
-
-1. **Active Mode** (~80mA)
-   - All sensors active
-   - BLE advertising/connected
-   - Display on
-   - Duration: 6-7 hours (500mAh battery)
-
-2. **Deep Sleep Mode** (~500µA)
-   - All peripherals off except RTC
-   - Wake every 15 minutes for data sync
-   - Duration: 40+ days
-
-3. **Typical Use** (~12mA avg)
-   - Mixed active/sleep periods
-   - 2 hours active per day
-   - Duration: 2-3 days
-
-### Sleep Scheduling
-
+### 1. WiFi Credentials
+Edit `include/config.h`:
 ```cpp
-// Enter deep sleep after 15 minutes of inactivity
-const unsigned long DEEP_SLEEP_INTERVAL = 15 * 60 * 1000;
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 ```
 
-## Display Functions
-
-### `updateDisplay()`
-
-Updates OLED display with current vitals:
-- Heart Rate (BPM)
-- SpO₂ (%)
-- Temperature (°C)
-- Step count
-- Battery level (%)
-- BLE connection status
-
-**Update Rate**: 1 second
-
-## Alert System
-
-### Abnormal Reading Detection
-
+### 2. Backend API
+Edit `include/config.h`:
 ```cpp
-// High heart rate (>120 BPM) or low (<50 BPM)
-if (vitals.heartRate > 120 || vitals.heartRate < 50) {
-  vibrate(200);
-}
-
-// Low SpO₂ (<90%)
-if (vitals.spo2 < 90) {
-  vibrate(500);
-}
-
-// Abnormal temperature (>38°C or <35°C)
-if (vitals.temperature > 38.0 || vitals.temperature < 35.0) {
-  vibrate(300);
-}
+#define API_BASE_URL "http://192.168.1.100:8000"
 ```
 
-## Backend Sync
-
-### Wi-Fi Configuration
-
-Edit in `main.cpp`:
+### 3. LCD I2C Address
+If LCD doesn't display, try changing address in `config.h`:
 ```cpp
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-const char* backendUrl = "http://your-backend-api.com/api/v1/vitals/upload";
-```
-
-### Sync Interval
-
-- Default: Every 15 minutes
-- HTTP POST to backend API
-- JSON payload format:
-```json
-{
-  "user_id": "device_001",
-  "timestamp": 1234567890,
-  "heart_rate": 72.5,
-  "spo2": 98,
-  "temperature": 36.5,
-  "steps": 5432,
-  "accel_x": 0.1,
-  "accel_y": -0.2,
-  "accel_z": 9.8
-}
+#define LCD_I2C_ADDRESS 0x3F  // Change from 0x27 if needed
 ```
 
 ## Building & Uploading
 
-### Prerequisites
-- PlatformIO installed
-- ESP32-S3 development board
-- USB cable
-
-### Build Commands
+### PlatformIO
 ```bash
-# Install dependencies
-pio lib install
-
-# Build firmware
-pio run
-
-# Upload to device
-pio run -t upload
-
-# Monitor serial output
-pio device monitor
+cd health-firmware
+pio run -t upload -t monitor
 ```
 
-### Configuration
+### Arduino IDE
+1. Install libraries:
+   - OneWire
+   - DallasTemperature
+   - LiquidCrystal_I2C
+   - ArduinoJson
+2. Select board: ESP32 Dev Module
+3. Upload
 
-Edit `platformio.ini` for different ESP32 variants:
-```ini
-[env:esp32-s3-devkitc-1]
-board = esp32-s3-devkitc-1  # Change for different board
+## LCD Screens
+
+### Screen 1: Live Vitals (Main)
 ```
+HR:72 BPM  O2:98%
+Temp: 36.8C
+Batt: 78%    WiFi:Y
+Status: Normal
+```
+
+### Screen 2: Sensor Status
+```
+Sensor Status:
+HR:  Good (95%)
+SpO2:Good (90%)
+Temp: DS18B20
+```
+
+### Screen 3: Alerts
+```
+CRITICAL ALERT!
+Low SpO2: 89%
+SEEK MEDICAL HELP!
+[Auto-rotate 10s]
+```
+
+### Screen 4: Summary
+```
+Current Stats:
+HR: 72 BPM
+SpO2: 98%
+Temp: 36.8C
+```
+
+## Temperature Failover Logic
+
+### Normal Operation (DS18B20 Working)
+- Reads DS18B20 every 10 seconds
+- Displays "DS18B20" as source
+- Temperature accurate to ±0.5°C
+
+### Failover Triggered When:
+- DS18B20 returns -127°C (disconnected)
+- Reading out of range (< 30°C or > 45°C)
+- No response after 3 attempts
+
+### Fallback Mode (Liebermeister's Rule)
+- Formula: `Temp = 36.5 + ((Current_HR - Resting_HR) / 10)`
+- Displays "(Est)" on LCD
+- Source shows "ESTIMATED"
+- **Warning**: Only accurate at rest - exercise inflates estimate
+
+### Auto-Recovery
+- Continues trying DS18B20 every 10 seconds
+- Automatically switches back when sensor reconnects
+- User notified via LCD display change
+
+## Alert Levels
+
+### CRITICAL (Rapid LED Blink - 250ms)
+- SpO2 < 90%
+- Hypothermia (< 35.5°C)
+
+### WARNING (Slow LED Blink - 500ms)
+- SpO2 90-94%
+- High HR (> 100 BPM)
+- Low HR (< 50 BPM)
+- Fever (> 38°C)
+
+### INFO
+- Temperature estimated
+- Low battery (< 20%)
+
+## Serial Monitor Output
+
+```
+===== Multi-Vitals Health Monitor =====
+Device ID: ESP32_A4CF12EF3B2C
+Backend: http://192.168.1.100:8000/health/vitals
+========================================
+WiFi connected
+IP: 192.168.1.150
+✓ Data sent to /health/vitals
+✓ Data sent to /health/vitals
+```
+
+## Calibration
+
+### Resting Heart Rate
+For accurate temperature estimation, calibrate resting HR:
+1. Sit still for 5 minutes
+2. Note average HR from LCD
+3. Use mobile app or backend to set resting HR
+4. ESP32 stores in Preferences (persists across reboots)
 
 ## Troubleshooting
 
-### Sensor Not Detected
-1. Check I²C wiring (SDA/SCL)
-2. Verify sensor power (3.3V)
-3. Check I²C address (use I²C scanner)
-4. Ensure pull-up resistors (10kΩ) on SDA/SCL
+### LCD Not Displaying
+- Check I2C address (0x27 or 0x3F)
+- Run I2C scanner to find address
+- Verify SDA/SCL connections
 
-### BLE Not Connecting
-1. Check if device is advertising (scan with phone)
-2. Verify service/characteristic UUIDs match app
-3. Check BLE power (ensure not in deep sleep)
-4. Restart ESP32
+### No Heart Rate Reading
+- Ensure Sen-11574 is properly connected to GPIO 34
+- Place finger firmly on sensor
+- Check signal quality on Screen 2
 
-### Display Not Showing
-1. Check I²C connection
-2. Verify OLED address (usually 0x3C)
-3. Check display contrast/brightness
-4. Ensure display.init() succeeded
+### Temperature Always Estimated
+- Check DS18B20 connections
+- Verify 4.7kΩ pull-up resistor
+- Try different DS18B20 sensor
 
-### High Power Consumption
-1. Enable deep sleep mode
-2. Reduce sensor sampling rates
-3. Turn off display when not needed
-4. Disable Wi-Fi when not syncing
+### WiFi Won't Connect
+- Verify SSID/password in config.h
+- Check router allows ESP32 connections
+- Try moving closer to router
 
-## Code Structure
+### Cloud Sync Failing
+- Verify backend is running
+- Check API_BASE_URL in config.h
+- Ensure backend has `/health/vitals` endpoint
+- Check firewall settings
+
+## Data Flow
 
 ```
-health-firmware/
-├── src/
-│   └── main.cpp          # Main firmware code
-├── include/
-│   ├── heartRate.h       # Heart rate detection algorithm
-│   ├── MAX30205.h        # Temperature sensor driver
-│   └── MAX30105.h        # PPG sensor wrapper
-└── platformio.ini        # Build configuration
+Sen-11574 (500Hz) → PulseSensor Class → HR + SpO2 Values
+                                              ↓
+DS18B20 (10s) → TemperatureSensor Class → Temp Value (or estimate)
+                                              ↓
+                        Update currentVitals Structure
+                                   ↓
+                   ┌──────────┬────────┬──────────┐
+                   ↓          ↓        ↓          ↓
+                  LCD      Alerts    LEDs    Cloud Sync
+               (500ms)   (1000ms)  (Instant)  (5000ms)
 ```
 
-## Key Functions
+## Power Consumption
 
-| Function | Purpose |
-|----------|---------|
-| `initSensors()` | Initialize all sensors |
-| `initDisplay()` | Initialize OLED display |
-| `initBLE()` | Setup BLE server & characteristics |
-| `updateHeartRate()` | Read and calculate heart rate |
-| `updateSpO2()` | Calculate blood oxygen saturation |
-| `updateTemperature()` | Read body temperature |
-| `updateIMU()` | Read accelerometer/gyroscope |
-| `updateDisplay()` | Refresh OLED display |
-| `sendBLEData()` | Send vitals via BLE |
-| `syncToBackend()` | HTTP POST to backend API |
-| `readBatteryLevel()` | Read battery voltage |
-| `vibrate()` | Trigger haptic feedback |
-| `enterDeepSleep()` | Enter low-power mode |
+- **Active WiFi**: ~160mA
+- **LCD Backlight**: ~20mA
+- **Sensors**: ~10mA
+- **Total**: ~190mA
 
-## Future Enhancements
+**Battery Life Estimate** (2000mAh LiPo):
+- ~10 hours continuous operation
+- Implement deep sleep for longer life
 
-- [ ] Implement Kalman filtering for sensor data
-- [ ] Add HRV (Heart Rate Variability) analysis
-- [ ] Implement sleep stage classification
-- [ ] Add gesture recognition (IMU-based)
-- [ ] Implement OTA (Over-The-Air) updates
-- [ ] Add data encryption for BLE
-- [ ] Implement user authentication
-- [ ] Add configurable alert thresholds
+## Next Steps
+1. Flash firmware to ESP32
+2. Configure WiFi and API settings
+3. Start backend server
+4. Place finger on Sen-11574
+5. Observe vitals on LCD
+6. Check backend receives data
 
-## License
-
-MIT License - See main project README
-
-
+## Safety Notice
+⚠️ **This is a prototype educational project**
+- Not FDA approved
+- Not for medical diagnosis
+- SpO2 readings are estimates
+- Seek professional medical attention for health concerns
