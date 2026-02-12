@@ -11,6 +11,7 @@ class VitalSigns {
   final int batteryPercent;
   final double batteryVoltage;
   final int wifiRssi;
+  final String? monitoringState; // idle, monitoring, paused
 
   VitalSigns({
     required this.heartRate,
@@ -24,6 +25,7 @@ class VitalSigns {
     required this.batteryPercent,
     required this.batteryVoltage,
     required this.wifiRssi,
+    this.monitoringState,
   });
 
   factory VitalSigns.fromJson(Map<String, dynamic> json) {
@@ -41,6 +43,7 @@ class VitalSigns {
       batteryPercent: json['battery_percent'] ?? 0,
       batteryVoltage: (json['battery_voltage'] ?? 0.0).toDouble(),
       wifiRssi: json['wifi_rssi'] ?? 0,
+      monitoringState: json['monitoring_state'],
     );
   }
 

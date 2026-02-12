@@ -7,13 +7,53 @@ import '../models/vitals_model.dart';
 
 /// API Service for Health Monitoring Backend
 class HealthApiService {
+  // Debug logging helpers
+  void _logRequest(
+    String method,
+    String url, {
+    Map<String, String>? headers,
+    String? body,
+  }) {
+    print('\n🔵 ═══ API REQUEST ═══');
+    print('Method: $method');
+    print('URL: $url');
+    if (headers != null && headers.isNotEmpty) {
+      print('Headers: $headers');
+    }
+    if (body != null) {
+      print('Body: $body');
+    }
+    print('════════════════════\n');
+  }
+
+  void _logResponse(String method, String url, int statusCode, String body) {
+    final icon = statusCode >= 200 && statusCode < 300 ? '🟢' : '🔴';
+    print('\n$icon ═══ API RESPONSE ═══');
+    print('Method: $method');
+    print('URL: $url');
+    print('Status: $statusCode');
+    print('Body: $body');
+    print('═════════════════════\n');
+  }
+
+  void _logError(String method, String url, dynamic error) {
+    print('\n🔴 ═══ API ERROR ═══');
+    print('Method: $method');
+    print('URL: $url');
+    print('Error: $error');
+    print('═══════════════════\n');
+  }
+
   // Get latest vitals for a device
   Future<VitalSigns?> getLatestVitals(String deviceId) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.vitalsEndpoint}/$deviceId/latest',
+    );
+
     try {
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.vitalsEndpoint}/$deviceId/latest',
-      );
+      _logRequest('GET', url.toString());
       final response = await http.get(url).timeout(ApiConfig.timeout);
+      _logResponse('GET', url.toString(), response.statusCode, response.body);
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -25,7 +65,7 @@ class HealthApiService {
         throw Exception('Failed to load vitals: ${response.statusCode}');
       }
     } catch (e) {
-      print('Error fetching vitals: $e');
+      _logError('GET', url.toString(), e);
       return null;
     }
   }
@@ -37,18 +77,20 @@ class HealthApiService {
     DateTime? endDate,
     int limit = 100,
   }) async {
+    final queryParams = {
+      'limit': limit.toString(),
+      if (startDate != null) 'start_date': startDate.toIso8601String(),
+      if (endDate != null) 'end_date': endDate.toIso8601String(),
+    };
+
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.vitalsEndpoint}/$deviceId/history',
+    ).replace(queryParameters: queryParams);
+
     try {
-      final queryParams = {
-        'limit': limit.toString(),
-        if (startDate != null) 'start_date': startDate.toIso8601String(),
-        if (endDate != null) 'end_date': endDate.toIso8601String(),
-      };
-
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.vitalsEndpoint}/$deviceId/history',
-      ).replace(queryParameters: queryParams);
-
+      _logRequest('GET', url.toString());
       final response = await http.get(url).timeout(ApiConfig.timeout);
+      _logResponse('GET', url.toString(), response.statusCode, response.body);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);
@@ -57,18 +99,21 @@ class HealthApiService {
         throw Exception('Failed to load history: ${response.statusCode}');
       }
     } catch (e) {
-      print('Error fetching history: $e');
+      _logError('GET', url.toString(), e);
       return [];
     }
   }
 
   // Get all alerts for device
   Future<List<HealthAlert>> getAlerts(String deviceId) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.alertsEndpoint}/$deviceId',
+    );
+
     try {
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.alertsEndpoint}/$deviceId',
-      );
+      _logRequest('GET', url.toString());
       final response = await http.get(url).timeout(ApiConfig.timeout);
+      _logResponse('GET', url.toString(), response.statusCode, response.body);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);
@@ -77,18 +122,21 @@ class HealthApiService {
         throw Exception('Failed to load alerts: ${response.statusCode}');
       }
     } catch (e) {
-      print('Error fetching alerts: $e');
+      _logError('GET', url.toString(), e);
       return [];
     }
   }
 
   // Get critical alerts only
   Future<List<HealthAlert>> getCriticalAlerts(String deviceId) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.alertsEndpoint}/$deviceId/critical',
+    );
+
     try {
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.alertsEndpoint}/$deviceId/critical',
-      );
+      _logRequest('GET', url.toString());
       final response = await http.get(url).timeout(ApiConfig.timeout);
+      _logResponse('GET', url.toString(), response.statusCode, response.body);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);
@@ -99,33 +147,39 @@ class HealthApiService {
         );
       }
     } catch (e) {
-      print('Error fetching critical alerts: $e');
+      _logError('GET', url.toString(), e);
       return [];
     }
   }
 
   // Acknowledge alert
   Future<bool> acknowledgeAlert(int alertId) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.alertsEndpoint}/$alertId/acknowledge',
+    );
+
     try {
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.alertsEndpoint}/$alertId/acknowledge',
-      );
+      _logRequest('PUT', url.toString());
       final response = await http.put(url).timeout(ApiConfig.timeout);
+      _logResponse('PUT', url.toString(), response.statusCode, response.body);
 
       return response.statusCode == 200;
     } catch (e) {
-      print('Error acknowledging alert: $e');
+      _logError('PUT', url.toString(), e);
       return false;
     }
   }
 
   // Get device info
   Future<HealthDevice?> getDevice(String deviceId) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}/$deviceId',
+    );
+
     try {
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}/$deviceId',
-      );
+      _logRequest('GET', url.toString());
       final response = await http.get(url).timeout(ApiConfig.timeout);
+      _logResponse('GET', url.toString(), response.statusCode, response.body);
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -136,28 +190,33 @@ class HealthApiService {
         throw Exception('Failed to load device: ${response.statusCode}');
       }
     } catch (e) {
-      print('Error fetching device: $e');
+      _logError('GET', url.toString(), e);
       return null;
     }
   }
 
   // Set resting heart rate (calibration)
   Future<bool> setRestingHR(String deviceId, double restingHR) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}/$deviceId/calibrate',
+    );
+    final body = jsonEncode({'resting_hr': restingHR});
+
     try {
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}/$deviceId/calibrate',
+      _logRequest(
+        'POST',
+        url.toString(),
+        body: body,
+        headers: {'Content-Type': 'application/json'},
       );
       final response = await http
-          .post(
-            url,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'resting_hr': restingHR}),
-          )
+          .post(url, headers: {'Content-Type': 'application/json'}, body: body)
           .timeout(ApiConfig.timeout);
+      _logResponse('POST', url.toString(), response.statusCode, response.body);
 
       return response.statusCode == 200;
     } catch (e) {
-      print('Error setting resting HR: $e');
+      _logError('POST', url.toString(), e);
       return false;
     }
   }
@@ -167,12 +226,14 @@ class HealthApiService {
     String deviceId, {
     String period = 'daily', // daily, weekly, monthly
   }) async {
-    try {
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.analyticsEndpoint}/$deviceId/summary',
-      ).replace(queryParameters: {'period': period});
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.analyticsEndpoint}/$deviceId/summary',
+    ).replace(queryParameters: {'period': period});
 
+    try {
+      _logRequest('GET', url.toString());
       final response = await http.get(url).timeout(ApiConfig.timeout);
+      _logResponse('GET', url.toString(), response.statusCode, response.body);
 
       if (response.statusCode == 200) {
         return jsonDecode(response.body);
@@ -180,7 +241,7 @@ class HealthApiService {
         throw Exception('Failed to load stats: ${response.statusCode}');
       }
     } catch (e) {
-      print('Error fetching stats: $e');
+      _logError('GET', url.toString(), e);
       return null;
     }
   }
@@ -190,12 +251,14 @@ class HealthApiService {
     String deviceId, {
     int hours = 24,
   }) async {
-    try {
-      final url = Uri.parse(
-        '${ApiConfig.baseUrl}${ApiConfig.analyticsEndpoint}/$deviceId/correlation',
-      ).replace(queryParameters: {'hours': hours.toString()});
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.analyticsEndpoint}/$deviceId/correlation',
+    ).replace(queryParameters: {'hours': hours.toString()});
 
+    try {
+      _logRequest('GET', url.toString());
       final response = await http.get(url).timeout(ApiConfig.timeout);
+      _logResponse('GET', url.toString(), response.statusCode, response.body);
 
       if (response.statusCode == 200) {
         return jsonDecode(response.body);
@@ -203,7 +266,7 @@ class HealthApiService {
         throw Exception('Failed to load correlation: ${response.statusCode}');
       }
     } catch (e) {
-      print('Error fetching correlation: $e');
+      _logError('GET', url.toString(), e);
       return null;
     }
   }
@@ -215,20 +278,25 @@ class HealthApiService {
     int? age,
     String? gender,
   }) async {
+    final url = Uri.parse('${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}');
+    final body = jsonEncode({
+      'device_id': deviceId,
+      if (userName != null) 'user_name': userName,
+      if (age != null) 'age': age,
+      if (gender != null) 'gender': gender,
+    });
+
     try {
-      final url = Uri.parse('${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}');
+      _logRequest(
+        'POST',
+        url.toString(),
+        body: body,
+        headers: {'Content-Type': 'application/json'},
+      );
       final response = await http
-          .post(
-            url,
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'device_id': deviceId,
-              if (userName != null) 'user_name': userName,
-              if (age != null) 'age': age,
-              if (gender != null) 'gender': gender,
-            }),
-          )
+          .post(url, headers: {'Content-Type': 'application/json'}, body: body)
           .timeout(ApiConfig.timeout);
+      _logResponse('POST', url.toString(), response.statusCode, response.body);
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -237,7 +305,85 @@ class HealthApiService {
         throw Exception('Failed to register device: ${response.statusCode}');
       }
     } catch (e) {
-      print('Error registering device: $e');
+      _logError('POST', url.toString(), e);
+      return null;
+    }
+  }
+
+  // ==================== DEVICE STATE CONTROL ====================
+
+  /// Set monitoring state (idle, monitoring, paused)
+  /// Device will poll and update its state accordingly
+  Future<bool> setMonitoringState(String deviceId, String state) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}/$deviceId/state',
+    );
+    final body = jsonEncode({'state': state});
+
+    try {
+      _logRequest(
+        'POST',
+        url.toString(),
+        body: body,
+        headers: {'Content-Type': 'application/json'},
+      );
+      final response = await http
+          .post(url, headers: {'Content-Type': 'application/json'}, body: body)
+          .timeout(ApiConfig.timeout);
+      _logResponse('POST', url.toString(), response.statusCode, response.body);
+
+      return response.statusCode == 200;
+    } catch (e) {
+      _logError('POST', url.toString(), e);
+      return false;
+    }
+  }
+
+  /// Get pending state commands for device (polled by device)
+  Future<Map<String, dynamic>?> getPendingState(String deviceId) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}/$deviceId/state/pending',
+    );
+
+    try {
+      _logRequest('GET', url.toString());
+      final response = await http.get(url).timeout(ApiConfig.timeout);
+      _logResponse('GET', url.toString(), response.statusCode, response.body);
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      } else {
+        throw Exception('Failed to get pending state: ${response.statusCode}');
+      }
+    } catch (e) {
+      _logError('GET', url.toString(), e);
+      return null;
+    }
+  }
+
+  /// Clear all vitals and alerts for a device (keeps registration)
+  Future<Map<String, dynamic>?> clearDeviceData(String deviceId) async {
+    final url = Uri.parse(
+      '${ApiConfig.baseUrl}${ApiConfig.devicesEndpoint}/$deviceId/data',
+    );
+
+    try {
+      _logRequest('DELETE', url.toString());
+      final response = await http.delete(url).timeout(ApiConfig.timeout);
+      _logResponse(
+        'DELETE',
+        url.toString(),
+        response.statusCode,
+        response.body,
+      );
+
+      if (response.statusCode == 200) {
+        return jsonDecode(response.body);
+      } else {
+        throw Exception('Failed to clear data: ${response.statusCode}');
+      }
+    } catch (e) {
+      _logError('DELETE', url.toString(), e);
       return null;
     }
   }

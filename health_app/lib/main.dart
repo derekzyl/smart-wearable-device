@@ -67,95 +67,97 @@ class _DeviceSetupScreenState extends State<DeviceSetupScreen> {
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.favorite,
-                size: 80,
-                color: Theme.of(context).colorScheme.primary,
-              ),
-              const SizedBox(height: 24),
-              Text(
-                'Health Monitor',
-                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
-                  fontWeight: FontWeight.bold,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.favorite,
+                  size: 80,
+                  color: Theme.of(context).colorScheme.primary,
                 ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Real-time vitals monitoring',
-                style: Theme.of(
-                  context,
-                ).textTheme.bodyLarge?.copyWith(color: Colors.grey),
-              ),
-              const SizedBox(height: 48),
-              TextField(
-                controller: _deviceIdController,
-                decoration: InputDecoration(
-                  labelText: 'Device ID',
-                  hintText: 'Enter your ESP32 device ID',
-                  prefixIcon: const Icon(Icons.devices),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
+                const SizedBox(height: 24),
+                Text(
+                  'Health Monitor',
+                  style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
                   ),
                 ),
-                textInputAction: TextInputAction.done,
-                onSubmitted: (_) => _connectToDevice(),
-              ),
-              const SizedBox(height: 16),
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: _connectToDevice,
-                  icon: const Icon(Icons.link),
-                  label: const Text('Connect'),
-                  style: FilledButton.styleFrom(
-                    padding: const EdgeInsets.all(16),
-                    shape: RoundedRectangleBorder(
+                const SizedBox(height: 8),
+                Text(
+                  'Real-time vitals monitoring',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodyLarge?.copyWith(color: Colors.grey),
+                ),
+                const SizedBox(height: 48),
+                TextField(
+                  controller: _deviceIdController,
+                  decoration: InputDecoration(
+                    labelText: 'Device ID',
+                    hintText: 'Enter your ESP32 device ID',
+                    prefixIcon: const Icon(Icons.devices),
+                    border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(12),
                     ),
                   ),
+                  textInputAction: TextInputAction.done,
+                  onSubmitted: (_) => _connectToDevice(),
                 ),
-              ),
-              const SizedBox(height: 24),
-              Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.blue.shade50,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(Icons.info_outline, color: Colors.blue.shade700),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Quick Start',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            color: Colors.blue.shade700,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      '1. Power on your ESP32 health device\n'
-                      '2. Check Serial Monitor for Device ID\n'
-                      '3. Enter the ID above (e.g., ESP32_A4CF12EF)\n'
-                      '4. Monitor your vitals in real-time',
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: Colors.blue.shade900,
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: _connectToDevice,
+                    icon: const Icon(Icons.link),
+                    label: const Text('Connect'),
+                    style: FilledButton.styleFrom(
+                      padding: const EdgeInsets.all(16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
                       ),
                     ),
-                  ],
+                  ),
                 ),
-              ),
-            ],
+                const SizedBox(height: 24),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(Icons.info_outline, color: Colors.blue.shade700),
+                          const SizedBox(width: 8),
+                          Text(
+                            'Quick Start',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.blue.shade700,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        '1. Power on your ESP32 health device\n'
+                        '2. Check Serial Monitor for Device ID\n'
+                        '3. Enter the ID above (e.g., ESP32_A4CF12EF)\n'
+                        '4. Monitor your vitals in real-time',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: Colors.blue.shade900,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

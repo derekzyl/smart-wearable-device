@@ -258,45 +258,116 @@ class _SettingsScreenState extends State<SettingsScreen> {
           // Danger Zone
           Padding(
             padding: const EdgeInsets.all(16),
-            child: OutlinedButton.icon(
-              onPressed: () {
-                showDialog(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('Clear All Data'),
-                    content: const Text(
-                      'This will clear all local settings and cached data. Your device will remain registered on the server.',
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(context),
-                        child: const Text('Cancel'),
-                      ),
-                      TextButton(
-                        onPressed: () {
-                          _prefs.clear();
-                          Navigator.pop(context);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('All data cleared')),
-                          );
-                        },
-                        child: const Text(
-                          'Clear',
-                          style: TextStyle(color: Colors.red),
-                        ),
-                      ),
-                    ],
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  'DATA MANAGEMENT',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.red[700],
                   ),
-                );
-              },
-              icon: const Icon(Icons.delete_outline, color: Colors.red),
-              label: const Text(
-                'Clear All Data',
-                style: TextStyle(color: Colors.red),
-              ),
-              style: OutlinedButton.styleFrom(
-                side: const BorderSide(color: Colors.red),
-              ),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    showDialog(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        title: const Text('Reset Data'),
+                        content: const Text('Choose what data to clear:'),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context),
+                            child: const Text('Cancel'),
+                          ),
+                          TextButton(
+                            onPressed: () async {
+                              // Clear only local app data
+                              await _prefs.clear();
+                              if (context.mounted) {
+                                Navigator.pop(context);
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('App data cleared'),
+                                    backgroundColor: Colors.green,
+                                  ),
+                                );
+                              }
+                            },
+                            child: const Text(
+                              'App Only',
+                              style: TextStyle(color: Colors.orange),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: () async {
+                              // Clear both app AND backend data
+                              Navigator.pop(context);
+
+                              // Show loading
+                              showDialog(
+                                context: context,
+                                barrierDismissible: false,
+                                builder: (context) => const Center(
+                                  child: CircularProgressIndicator(),
+                                ),
+                              );
+
+                              final result = await _apiService.clearDeviceData(
+                                widget.deviceId,
+                              );
+
+                              if (context.mounted) {
+                                Navigator.pop(context); // Close loading
+
+                                if (result != null) {
+                                  await _prefs.clear();
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                      content: Text(
+                                        'All data cleared: ${result['message']}',
+                                      ),
+                                      backgroundColor: Colors.green,
+                                    ),
+                                  );
+                                } else {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text(
+                                        'Failed to clear backend data',
+                                      ),
+                                      backgroundColor: Colors.red,
+                                    ),
+                                  );
+                                }
+                              }
+                            },
+                            child: const Text(
+                              'Full Reset',
+                              style: TextStyle(color: Colors.red),
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.delete_sweep, color: Colors.red),
+                  label: const Text(
+                    'Reset All Data',
+                    style: TextStyle(color: Colors.red),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: Colors.red),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '• App Only: Clears local settings\n• Full Reset: Clears vitals & alerts from server',
+                  style: TextStyle(fontSize: 11, fontStyle: FontStyle.italic),
+                ),
+              ],
             ),
           ),
         ],
