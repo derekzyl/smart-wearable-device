@@ -3,13 +3,12 @@
  * ESP32 Firmware for HR, SpO2, and Temperature Monitoring
  * 
  * Features:
- * - Heart Rate monitoring from Sen-11574 PPG sensor
- * - SpO2 (blood oxygen) monitoring from Sen-11574
+ * - Dual Heart Rate sensors: MAX30102 (I2C) + SEN11574 (Analog PPG)
+ * - Dual SpO2 monitoring with sensor fusion/fallback
  * - Temperature with DS18B20 failover to Liebermeister's Rule
  * - 20x4 LCD display with 4 screens
  * - WiFi cloud sync to /health/vitals endpoint
  * - Critical alert LED system
- * - Battery monitoring
  */
 
 #include <Arduino.h>
@@ -21,15 +20,18 @@
 #include <DallasTemperature.h>
 #include <LiquidCrystal_I2C.h>
 #include <Preferences.h>
+#include "MAX30105.h"
+#include "heartRate.h"
 
 // ==================== PIN DEFINITIONS ====================
 #define SDA_PIN 21
 #define SCL_PIN 22
 #define DS18B20_PIN 4
-#define SEN11574_PIN 34        // ADC1_CH6
-#define BATTERY_ADC_PIN 35     // ADC1_CH7
+#define SEN11574_PIN 34        // ADC1_CH6 - Analog PPG sensor
 #define STATUS_LED 2           // Built-in LED
-#define ALERT_LED 5            // External Red LED
+#define BUTTON_START 32        // Start/Resume button (active LOW) - Safe GPIO
+#define BUTTON_STOP 33         // Stop/Pause button (active LOW) - Safe GPIO
+// MAX30102 uses I2C (SDA_PIN, SCL_PIN)
 
 // ==================== CONFIGURATION ====================
 const char* WIFI_SSID = "cybergenii";
@@ -42,12 +44,22 @@ OneWire oneWire(DS18B20_PIN);
 DallasTemperature dallas(&oneWire);
 LiquidCrystal_I2C lcd(0x27, 20, 4);  // Try 0x3F if 0x27 doesn't work
 Preferences preferences;
+MAX30105 max30102;  // MAX30102 sensor object
+
+// ==================== MONITORING STATE ====================
+enum MonitoringState {
+    STATE_IDLE,
+    STATE_MONITORING,
+    STATE_PAUSED
+};
 
 // ==================== GLOBAL VARIABLES ====================
 String deviceID;
 int currentScreen = 0;
 unsigned long lastScreenChange = 0;
 bool manualScreenLock = false;
+MonitoringState monitoringState = STATE_IDLE;
+String monitoringStateStr = "idle";
 
 // ==================== VITAL SIGNS STRUCTURE ====================
 struct VitalSigns {
@@ -58,8 +70,8 @@ struct VitalSigns {
     float temperature = 36.5;
     bool tempEstimated = false;
     String tempSource = "UNKNOWN";
-    int batteryPercent = 100;
-    float batteryVoltage = 3.7;
+    String hrSource = "NONE";      // "MAX30102", "SEN11574", or "NONE"
+    String spo2Source = "NONE";    // "MAX30102", "SEN11574", or "NONE"
     
     bool hasAlert = false;
     String alertMessage = "";
@@ -264,6 +276,198 @@ public:
     }
 };
 
+// ==================== MAX30102 SENSOR CLASS ====================
+class MAX30102Sensor {
+private:
+    MAX30105* sensor;
+    bool available = false;
+    
+    const byte RATE_SIZE = 4;
+    byte rates[4];
+    byte rateSpot = 0;
+    long lastBeat = 0;
+    float beatsPerMinute = 0;
+    int beatAvg = 0;
+    
+    uint32_t irValue = 0;
+    uint32_t redValue = 0;
+    
+    int spo2Value = 0;
+    int spo2Quality = 0;
+    
+public:
+    MAX30102Sensor(MAX30105& max) : sensor(&max) {}
+    
+    bool begin() {
+        // Initialize sensor
+        if (!sensor->begin(Wire, I2C_SPEED_STANDARD)) {
+            Serial.println("MAX30102 not found!");
+            available = false;
+            return false;
+        }
+        
+        // Configure sensor
+        byte ledBrightness = 60;   // 0-255
+        byte sampleAverage = 4;     // 1, 2, 4, 8, 16, 32
+        byte ledMode = 2;           // 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+        byte sampleRate = 100;      // 50, 100, 200, 400, 800, 1000, 1600, 3200
+        int pulseWidth = 411;       // 69, 118, 215, 411
+        int adcRange = 4096;        // 2048, 4096, 8192, 16384
+        
+        sensor->setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+        sensor->setPulseAmplitudeRed(0x0A);   // Turn Red LED to low to indicate sensor is running
+        sensor->setPulseAmplitudeGreen(0);     // Turn off Green LED
+        
+        available = true;
+        Serial.println("MAX30102 initialized successfully!");
+        return true;
+    }
+    
+    void update() {
+        if (!available) return;
+        
+        // Read sensor values
+        irValue = sensor->getIR();
+        redValue = sensor->getRed();
+        
+        // Check if finger is detected (IR value > threshold)
+        if (irValue < 50000) {
+            beatsPerMinute = 0;
+            beatAvg = 0;
+            spo2Value = 0;
+            spo2Quality = 0;
+            return;
+        }
+        
+        // Detect heartbeat using IR value
+        if (checkForBeat(irValue)) {
+            // We found a beat!
+            long delta = millis() - lastBeat;
+            lastBeat = millis();
+            
+            beatsPerMinute = 60 / (delta / 1000.0);
+            
+            // Validate BPM (30-200 range)
+            if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+                rates[rateSpot++] = (byte)beatsPerMinute;
+                rateSpot %= RATE_SIZE;
+                
+                // Calculate average
+                beatAvg = 0;
+                for (byte x = 0; x < RATE_SIZE; x++) {
+                    beatAvg += rates[x];
+                }
+                beatAvg /= RATE_SIZE;
+            }
+        }
+        
+        // Calculate SpO2
+        calculateSpO2();
+    }
+    
+    void calculateSpO2() {
+        if (irValue < 50000 || redValue < 50000) {
+            spo2Value = 0;
+            spo2Quality = 0;
+            return;
+        }
+        
+        // Calculate R value (ratio of ratios)
+        // R = (AC_red / DC_red) / (AC_ir / DC_ir)
+        // Simplified SpO2 = 110 - 25*R
+        
+        float ratio = (float)redValue / (float)irValue;
+        
+        // Empirical formula for SpO2
+        spo2Value = (int)(110 - 25 * ratio);
+        
+        // Clamp to valid range
+        if (spo2Value > 100) spo2Value = 100;
+        if (spo2Value < 70) spo2Value = 70;
+        
+        // Quality based on signal strength
+        if (irValue > 100000) {
+            spo2Quality = 95;
+        } else if (irValue > 75000) {
+            spo2Quality = 80;
+        } else if (irValue > 50000) {
+            spo2Quality = 60;
+        } else {
+            spo2Quality = 30;
+        }
+    }
+    
+    bool checkForBeat(uint32_t sample) {
+        // Simple beat detection - looking for peaks
+        static uint32_t lastSample = 0;
+        static uint32_t peak = 0;
+        static uint32_t trough = 0;
+        static bool risingEdge = false;
+        static unsigned long lastBeatTime = 0;
+        
+        // Update peak and trough
+        if (sample > peak) peak = sample;
+        if (sample < trough || trough == 0) trough = sample;
+        
+        // Detect rising edge
+        uint32_t threshold = trough + (peak - trough) * 0.6;
+        
+        if (sample > threshold && lastSample <= threshold) {
+            risingEdge = true;
+        }
+        
+        if (risingEdge && sample < threshold) {
+            // Beat detected
+            unsigned long now = millis();
+            if (now - lastBeatTime > 300) {  // Debounce (min 200 BPM)
+                lastBeatTime = now;
+                risingEdge = false;
+                
+                // Reset peak/trough gradually
+                peak = peak * 0.95;
+                trough = trough * 1.05 + sample * 0.05;
+                
+                lastSample = sample;
+                return true;
+            }
+            risingEdge = false;
+        }
+        
+        lastSample = sample;
+        return false;
+    }
+    
+    int getBPM() {
+        if (!available) return 0;
+        return beatAvg;
+    }
+    
+    int getSpO2() {
+        if (!available) return 0;
+        return spo2Value;
+    }
+    
+    int getHRQuality() {
+        if (!available) return 0;
+        if (irValue < 50000) return 0;
+        if (beatAvg > 0) return 90;
+        return 50;
+    }
+    
+    int getSpO2Quality() {
+        if (!available) return 0;
+        return spo2Quality;
+    }
+    
+    bool isAvailable() {
+        return available;
+    }
+    
+    bool isFingerDetected() {
+        return available && irValue > 50000;
+    }
+};
+
 // ==================== TEMPERATURE SENSOR CLASS ====================
 class TemperatureSensor {
 private:
@@ -358,6 +562,7 @@ public:
 
 // ==================== GLOBAL SENSOR INSTANCES ====================
 PulseSensor pulseSensor;
+MAX30102Sensor max30102Sensor(max30102);
 TemperatureSensor tempSensor(dallas);
 
 // ==================== ALERT CHECKING ====================
@@ -415,12 +620,51 @@ void checkAlerts() {
         currentVitals.alertMessage = "Temp Estimated";
         return;
     }
+}
+
+// ==================== BUTTON HANDLERS ====================
+void handleButtons() {
+    static unsigned long lastStartPress = 0;
+    static unsigned long lastStopPress = 0;
+    const unsigned long DEBOUNCE_DELAY = 50;
     
-    // Priority 8: Low battery
-    if (currentVitals.batteryPercent < 20) {
-        currentVitals.hasAlert = true;
-        currentVitals.alertMessage = "Low Battery";
-        return;
+    // Read buttons (active LOW)
+    bool startPressed = (digitalRead(BUTTON_START) == LOW);
+    bool stopPressed = (digitalRead(BUTTON_STOP) == LOW);
+    
+    // Handle START button
+    if (startPressed && (millis() - lastStartPress > DEBOUNCE_DELAY)) {
+        lastStartPress = millis();
+        
+        if (monitoringState == STATE_IDLE || monitoringState == STATE_PAUSED) {
+            monitoringState = STATE_MONITORING;
+            monitoringStateStr = "monitoring";
+            Serial.println("→ State: MONITORING");
+            
+            // Flash status LED
+            digitalWrite(STATUS_LED, HIGH);
+            delay(100);
+            digitalWrite(STATUS_LED, LOW);
+        }
+    }
+    
+    // Handle STOP button
+    if (stopPressed && (millis() - lastStopPress > DEBOUNCE_DELAY)) {
+        lastStopPress = millis();
+        
+        if (monitoringState == STATE_MONITORING) {
+            monitoringState = STATE_PAUSED;
+            monitoringStateStr = "paused";
+            Serial.println("→ State: PAUSED");
+            
+            // Flash status LED twice
+            for (int i = 0; i < 2; i++) {
+                digitalWrite(STATUS_LED, HIGH);
+                delay(100);
+                digitalWrite(STATUS_LED, LOW);
+                delay(100);
+            }
+        }
     }
 }
 
@@ -447,18 +691,26 @@ void updateLCD() {
             }
             
             lcd.setCursor(0, 2);
-            lcd.print("Batt: ");
-            lcd.print(currentVitals.batteryPercent);
-            lcd.print("%");
+            lcd.print("HR Src: ");
+            lcd.print(currentVitals.hrSource);
             lcd.setCursor(10, 2);
             lcd.print(WiFi.status() == WL_CONNECTED ? "WiFi:Y" : "WiFi:N");
             
             lcd.setCursor(0, 3);
+            // Show monitoring state
+            if (monitoringState == STATE_MONITORING) {
+                lcd.print("[MON] ");
+            } else if (monitoringState == STATE_PAUSED) {
+                lcd.print("[PAUSE] ");
+            } else {
+                lcd.print("[IDLE] ");
+            }
+            
+            // Show alert if any
             if (currentVitals.hasAlert) {
-                lcd.print(currentVitals.isCriticalAlert ? "!ALERT! " : "Alert: ");
                 lcd.print(currentVitals.alertMessage.substring(0, 12));
             } else {
-                lcd.print("Status: Normal");
+                lcd.print("Ready");
             }
             break;
             
@@ -470,15 +722,15 @@ void updateLCD() {
             lcd.print("HR:  ");
             lcd.print(currentVitals.hrQuality > 50 ? "Good" : "Poor");
             lcd.print(" (");
-            lcd.print(currentVitals.hrQuality);
-            lcd.print("%)");
+            lcd.print(currentVitals.hrSource);
+            lcd.print(")");
             
             lcd.setCursor(0, 2);
             lcd.print("SpO2:");
             lcd.print(currentVitals.spo2Quality > 50 ? "Good" : "Poor");
             lcd.print(" (");
-            lcd.print(currentVitals.spo2Quality);
-            lcd.print("%)");
+            lcd.print(currentVitals.spo2Source);
+            lcd.print(")");
             
             lcd.setCursor(0, 3);
             lcd.print("Temp: ");
@@ -526,23 +778,60 @@ void updateLCD() {
 
 // ==================== VITAL SIGNS UPDATE ====================
 void updateVitals() {
-    // Heart rate and SpO2
-    currentVitals.heartRate = pulseSensor.getBPM();
-    currentVitals.hrQuality = pulseSensor.getSignalQuality();
-    currentVitals.spo2 = pulseSensor.getSpO2();
-    currentVitals.spo2Quality = pulseSensor.getSpO2Quality();
+    // Dual-sensor fusion for Heart Rate and SpO2
+    // Priority: MAX30102 (more accurate) > SEN11574 (fallback)
+    
+    int max30102_hr = max30102Sensor.getBPM();
+    int max30102_spo2 = max30102Sensor.getSpO2();
+    int max30102_hrQuality = max30102Sensor.getHRQuality();
+    int max30102_spo2Quality = max30102Sensor.getSpO2Quality();
+    
+    int sen11574_hr = pulseSensor.getBPM();
+    int sen11574_spo2 = pulseSensor.getSpO2();
+    int sen11574_hrQuality = pulseSensor.getSignalQuality();
+    int sen11574_spo2Quality = pulseSensor.getSpO2Quality();
+    
+    // Heart Rate Selection
+    if (max30102_hrQuality >= 60 && max30102_hr > 0) {
+        // Use MAX30102 if quality is good
+        currentVitals.heartRate = max30102_hr;
+        currentVitals.hrQuality = max30102_hrQuality;
+        currentVitals.hrSource = "MAX30102";
+    } else if (sen11574_hrQuality >= 50 && sen11574_hr > 0) {
+        // Fallback to SEN11574
+        currentVitals.heartRate = sen11574_hr;
+        currentVitals.hrQuality = sen11574_hrQuality;
+        currentVitals.hrSource = "SEN11574";
+    } else {
+        // No valid readings
+        currentVitals.heartRate = 0;
+        currentVitals.hrQuality = 0;
+        currentVitals.hrSource = "NONE";
+    }
+    
+    // SpO2 Selection
+    if (max30102_spo2Quality >= 60 && max30102_spo2 > 0) {
+        // Use MAX30102 for SpO2 (more accurate with dual LED)
+        currentVitals.spo2 = max30102_spo2;
+        currentVitals.spo2Quality = max30102_spo2Quality;
+        currentVitals.spo2Source = "MAX30102";
+    } else if (sen11574_spo2Quality >= 50 && sen11574_spo2 > 0) {
+        // Fallback to SEN11574 (less accurate, single wavelength)
+        currentVitals.spo2 = sen11574_spo2;
+        currentVitals.spo2Quality = sen11574_spo2Quality;
+        currentVitals.spo2Source = "SEN11574";
+    } else {
+        // No valid readings
+        currentVitals.spo2 = 0;
+        currentVitals.spo2Quality = 0;
+        currentVitals.spo2Source = "NONE";
+    }
     
     // Temperature with failover
     auto tempReading = tempSensor.getTemperature(currentVitals.heartRate);
     currentVitals.temperature = tempReading.celsius;
     currentVitals.tempEstimated = tempReading.isEstimated;
     currentVitals.tempSource = tempReading.source;
-    
-    // Battery
-    int rawBattery = analogRead(BATTERY_ADC_PIN);
-    currentVitals.batteryVoltage = (rawBattery / 4095.0) * 3.3 * 2.0;  // Voltage divider
-    currentVitals.batteryPercent = map((int)(currentVitals.batteryVoltage * 100), 340, 420, 0, 100);
-    currentVitals.batteryPercent = constrain(currentVitals.batteryPercent, 0, 100);
 }
 
 // ==================== CLOUD SYNC ====================
@@ -566,11 +855,13 @@ void sendToCloud() {
     hr["bpm"] = currentVitals.heartRate;
     hr["signal_quality"] = currentVitals.hrQuality;
     hr["is_valid"] = (currentVitals.heartRate > 0);
+    hr["source"] = currentVitals.hrSource;
     
     JsonObject spo2 = vitals.createNestedObject("spo2");
     spo2["percent"] = currentVitals.spo2;
     spo2["signal_quality"] = currentVitals.spo2Quality;
     spo2["is_valid"] = (currentVitals.spo2 > 0 && currentVitals.spo2Quality > 50);
+    spo2["source"] = currentVitals.spo2Source;
     
     JsonObject temp = vitals.createNestedObject("temperature");
     temp["celsius"] = currentVitals.temperature;
@@ -578,10 +869,9 @@ void sendToCloud() {
     temp["is_estimated"] = currentVitals.tempEstimated;
     
     JsonObject sys = doc.createNestedObject("system");
-    sys["battery_percent"] = currentVitals.batteryPercent;
-    sys["battery_voltage"] = currentVitals.batteryVoltage;
     sys["wifi_rssi"] = WiFi.RSSI();
     sys["uptime_seconds"] = millis() / 1000;
+    sys["monitoring_state"] = monitoringStateStr;
     
     if (currentVitals.hasAlert) {
         JsonArray alerts = doc.createNestedArray("alerts");
@@ -616,42 +906,73 @@ void sendToCloud() {
 
 // ==================== LED CONTROL ====================
 void updateLEDs() {
-    // Alert LED
-    if (currentVitals.hasAlert) {
-        // Blink faster for critical alerts
-        int blinkRate = currentVitals.isCriticalAlert ? 250 : 500;
-        
-        static unsigned long lastBlink = 0;
-        static bool ledState = false;
-        if (millis() - lastBlink > blinkRate) {
-            ledState = !ledState;
-            digitalWrite(ALERT_LED, ledState);
-            lastBlink = millis();
-        }
-    } else {
-        digitalWrite(ALERT_LED, LOW);
-    }
+    // Status LED indicates monitoring state
+    // (LED feedback is now handled in button handlers)
 }
 
 // ==================== WIFI CONNECTION ====================
 void connectWiFi() {
+    Serial.println("\n========== WiFi Diagnostics ==========");
+    Serial.print("SSID: ");
+    Serial.println(WIFI_SSID);
+    Serial.print("Password length: ");
+    Serial.println(strlen(WIFI_PASSWORD));
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+    
     Serial.print("Connecting to WiFi");
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     
     int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
         delay(500);
         Serial.print(".");
+        
+        // Print status every 5 attempts
+        if (attempts % 5 == 0) {
+            Serial.print("\n[Attempt ");
+            Serial.print(attempts);
+            Serial.print("] Status: ");
+            Serial.print(WiFi.status());
+            Serial.print(" - ");
+            
+            switch(WiFi.status()) {
+                case WL_IDLE_STATUS: Serial.print("IDLE"); break;
+                case WL_NO_SSID_AVAIL: Serial.print("NO_SSID_AVAILABLE"); break;
+                case WL_SCAN_COMPLETED: Serial.print("SCAN_COMPLETED"); break;
+                case WL_CONNECTED: Serial.print("CONNECTED"); break;
+                case WL_CONNECT_FAILED: Serial.print("CONNECT_FAILED"); break;
+                case WL_CONNECTION_LOST: Serial.print("CONNECTION_LOST"); break;
+                case WL_DISCONNECTED: Serial.print("DISCONNECTED"); break;
+                default: Serial.print("UNKNOWN"); break;
+            }
+            Serial.println();
+        }
+        
         attempts++;
     }
     
+    Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nWiFi connected");
-        Serial.print("IP: ");
+        Serial.println("✓ WiFi connected successfully!");
+        Serial.print("IP Address: ");
         Serial.println(WiFi.localIP());
+        Serial.print("RSSI: ");
+        Serial.print(WiFi.RSSI());
+        Serial.println(" dBm");
     } else {
-        Serial.println("\nWiFi connection failed");
+        Serial.println("✗ WiFi connection FAILED!");
+        Serial.print("Final status: ");
+        Serial.println(WiFi.status());
+        Serial.println("\nTroubleshooting:");
+        Serial.println("1. Check SSID is correct");
+        Serial.println("2. Check password is correct");
+        Serial.println("3. Check router is in range");
+        Serial.println("4. Check 2.4GHz WiFi is enabled");
     }
+    Serial.println("======================================\n");
 }
 
 // ==================== SCREEN AUTO-ROTATE ====================
@@ -676,8 +997,8 @@ void setup() {
     
     // Initialize hardware
     pinMode(STATUS_LED, OUTPUT);
-    pinMode(ALERT_LED, OUTPUT);
-    pinMode(BATTERY_ADC_PIN, INPUT);
+    pinMode(BUTTON_START, INPUT_PULLUP);  // Active LOW with internal pullup
+    pinMode(BUTTON_STOP, INPUT_PULLUP);   // Active LOW with internal pullup
     pinMode(SEN11574_PIN, INPUT);
     
     // Configure ADC
@@ -689,24 +1010,42 @@ void setup() {
     lcd.backlight();
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("VitalWatch v2.0");
+    lcd.print("VitalWatch v3.0");
     lcd.setCursor(0, 1);
-    lcd.print("HR + SpO2 Monitor");
+    lcd.print("HR+SpO2 w/ Buttons");
     lcd.setCursor(0, 2);
     lcd.print("Initializing...");
     
     // Preferences
     preferences.begin("health", false);
     
-    // Generate device ID
-    uint64_t chipid = ESP.getEfuseMac();
-    deviceID = "ESP32_" + String((uint32_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX);
-    deviceID.toUpperCase();
+    // Hardcoded device ID
+    deviceID = "HEALTH_DEVICE_001";
     
     // Initialize sensors
+    Serial.println("\n--- Initializing Sensors ---");
+    
+    Serial.print("DS18B20 Temperature... ");
     dallas.begin();
     tempSensor.begin();
+    Serial.println("OK");
+    
+    Serial.print("MAX30102 (I2C)... ");
+    if (max30102Sensor.begin()) {
+        Serial.println("OK");
+        lcd.setCursor(0, 2);
+        lcd.print("MAX30102: OK");
+    } else {
+        Serial.println("FAILED (will use SEN11574)");
+        lcd.setCursor(0, 2);
+        lcd.print("MAX30102: FAIL");
+    }
+    delay(1000);
+    
+    Serial.print("SEN11574 (Analog)... ");
     pulseSensor.begin();
+    Serial.println("OK");
+    Serial.println("--- Sensor Init Complete ---\n");
     
     // WiFi
     lcd.setCursor(0, 3);
@@ -723,10 +1062,14 @@ void setup() {
     
     lastScreenChange = millis();
     
-    Serial.println("===== Multi-Vitals Health Monitor =====");
+    
+    Serial.println("\n===== Multi-Vitals Health Monitor =====");
     Serial.println("Device ID: " + deviceID);
     Serial.println("Backend: " + API_BASE_URL + VITALS_ENDPOINT);
-    Serial.println("=====================================");
+    Serial.print("WiFi Status: ");
+    Serial.println(WiFi.status() == WL_CONNECTED ? "CONNECTED" : "NOT CONNECTED");
+    Serial.println("Setup complete. Starting main loop...");
+    Serial.println("=======================================");
 }
 
 // ==================== MAIN LOOP ====================
@@ -736,29 +1079,39 @@ void loop() {
     static unsigned long lastLCDUpdate = 0;
     static unsigned long lastVitalUpdate = 0;
     
-    // Read pulse sensor at 500Hz (every 2ms)
-    if (millis() - lastSensorRead >= 2) {
-        pulseSensor.update();
-        lastSensorRead = millis();
+    // Handle button input (always active)
+    handleButtons();
+    
+    // Only update sensors when in MONITORING state
+    if (monitoringState == STATE_MONITORING) {
+        // Read pulse sensors
+        // MAX30102 update (called frequently as it has internal buffering)
+        max30102Sensor.update();
+        
+        // SEN11574 update at 500Hz (every 2ms)
+        if (millis() - lastSensorRead >= 2) {
+            pulseSensor.update();
+            lastSensorRead = millis();
+        }
+        
+        // Update vitals every 1 second
+        if (millis() - lastVitalUpdate >= 1000) {
+            updateVitals();
+            checkAlerts();
+            lastVitalUpdate = millis();
+        }
+        
+        // Cloud sync every 5 seconds
+        if (millis() - lastCloudSync >= 5000 && WiFi.status() == WL_CONNECTED) {
+            sendToCloud();
+            lastCloudSync = millis();
+        }
     }
     
-    // Update vitals every 1 second
-    if (millis() - lastVitalUpdate >= 1000) {
-        updateVitals();
-        checkAlerts();
-        lastVitalUpdate = millis();
-    }
-    
-    // Update LCD every 500ms
+    // Update LCD every 500ms (always active)
     if (millis() - lastLCDUpdate >= 500) {
         updateLCD();
         lastLCDUpdate = millis();
-    }
-    
-    // Cloud sync every 5 seconds
-    if (millis() - lastCloudSync >= 5000 && WiFi.status() == WL_CONNECTED) {
-        sendToCloud();
-        lastCloudSync = millis();
     }
     
     // Handle screen rotation
