@@ -114,7 +114,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         newState = 'paused';
         break;
       case MonitoringState.paused:
-        newState = 'idle';
+        newState = 'monitoring'; // Resume
         break;
     }
 
@@ -123,6 +123,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
       newState,
     );
 
+    _handleStateChangeResult(success, newState);
+  }
+
+  Future<void> _stopMonitoring() async {
+    setState(() => _isTogglingState = true);
+
+    final success = await _apiService.setMonitoringState(
+      widget.deviceId,
+      'idle',
+    );
+
+    _handleStateChangeResult(success, 'idle');
+  }
+
+  void _handleStateChangeResult(bool success, String newState) {
     if (mounted) {
       setState(() => _isTogglingState = false);
 
@@ -161,10 +176,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
           IconButton(icon: const Icon(Icons.refresh), onPressed: _loadData),
         ],
       ),
-      floatingActionButton: MonitoringStateFAB(
-        currentState: _deviceState,
-        onPressed: _toggleDeviceState,
-        isLoading: _isTogglingState,
+      floatingActionButton: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (_deviceState != MonitoringState.idle) ...[
+            StopMonitorFAB(
+              onPressed: _stopMonitoring,
+              isLoading: _isTogglingState,
+            ),
+            const SizedBox(width: 16),
+          ],
+          MonitoringStateFAB(
+            currentState: _deviceState,
+            onPressed: _toggleDeviceState,
+            isLoading: _isTogglingState,
+          ),
+        ],
       ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())

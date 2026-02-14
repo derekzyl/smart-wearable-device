@@ -44,7 +44,7 @@ class MonitoringStateFAB extends StatelessWidget {
       case MonitoringState.monitoring:
         return Icons.pause;
       case MonitoringState.paused:
-        return Icons.stop;
+        return Icons.play_arrow; // Resume
     }
   }
 
@@ -55,7 +55,7 @@ class MonitoringStateFAB extends StatelessWidget {
       case MonitoringState.monitoring:
         return 'PAUSE';
       case MonitoringState.paused:
-        return 'STOP';
+        return 'RESUME';
     }
   }
 
@@ -66,7 +66,7 @@ class MonitoringStateFAB extends StatelessWidget {
       case MonitoringState.monitoring:
         return Colors.orange;
       case MonitoringState.paused:
-        return Colors.red;
+        return Colors.blue; // Resume color
     }
   }
 }
@@ -125,5 +125,37 @@ class StateIndicatorChip extends StatelessWidget {
       case MonitoringState.paused:
         return Colors.orange;
     }
+  }
+}
+
+/// Mini FAB for stopping monitoring
+class StopMonitorFAB extends StatelessWidget {
+  final VoidCallback onPressed;
+  final bool isLoading;
+
+  const StopMonitorFAB({
+    super.key,
+    required this.onPressed,
+    this.isLoading = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return FloatingActionButton.small(
+      onPressed: isLoading ? null : onPressed,
+      backgroundColor: Colors.red,
+      foregroundColor: Colors.white,
+      heroTag: 'stop_fab',
+      child: isLoading
+          ? const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: Colors.white,
+              ),
+            )
+          : const Icon(Icons.stop),
+    );
   }
 }
