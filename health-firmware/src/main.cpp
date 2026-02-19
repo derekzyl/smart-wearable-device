@@ -45,8 +45,8 @@
 #define BUTTON_STOP 19
 
 // ==================== CONFIGURATION ====================
-const char* WIFI_SSID = "Lumen";
-const char* WIFI_PASSWORD = "oselee99";
+const char* WIFI_SSID = "cybergenii";
+const char* WIFI_PASSWORD = "12341234";
 String API_BASE_URL = "https://xenophobic-netta-cybergenii-1584fde7.koyeb.app";
 const char* VITALS_ENDPOINT = "/health/vitals";
 
@@ -59,12 +59,21 @@ const int DAYLIGHT_OFFSET_SEC = 0;
 #define CLOUD_SYNC_INTERVAL 5000.
 #define LCD_UPDATE_INTERVAL 500
 #define WIFI_RECONNECT_INTERVAL 30000
-#define WATCHDOG_TIMEOUT 10
+#define WATCHDOG_TIMEOUT 30
 #define STATE_POLL_INTERVAL 10000
 
 #define MIN_QUALITY_THRESHOLD 40
 #define WIFI_MAX_RETRIES 5
 #define WIFI_RETRY_BASE_DELAY 1000
+
+// MAX30102 I2C address (standard; some modules allow 0x57 or 0x58 via ADDR pin)
+#define MAX30102_I2C_ADDR 0x57
+// IR: finger present when reflected IR is above this.
+#define MAX30102_FINGER_THRESHOLD 4000
+// RED: finger present when RED is above this (finger on ~200k+, removed ~6k).
+#define MAX30102_FINGER_THRESHOLD_RED 15000
+// 18-bit max = 262143. Above this we treat as saturated (no pulse visible).
+#define MAX30102_SATURATED 250000
 
 // ==================== HARDWARE OBJECTS ====================
 OneWire oneWire(DS18B20_PIN);
@@ -192,6 +201,7 @@ private:
     
     float smoothedSignal;
     float smoothAlpha;
+    int lastGoodRaw;
     
     int peakValue;
     int troughValue;
@@ -200,30 +210,42 @@ private:
     int signalQuality;
     float spo2Value;
     int spo2Quality;
+    int lastValidBPM;
+    int lastValidSpO2;
+    
+    unsigned long rawPeakTimes[8];
+    int rawPeakCount;
+    int rawPeakIndex;
+    bool rawPeakZone;
+    int rawPeakZoneMax;
+    unsigned long rawPeakZoneMaxTime;
+    int bpmFromRaw;
     
 public:
     PulseSensor() : bufferIndex(0), bufferFilled(false), lastBeatTime(0), currentBPM(0),
                     beatHistoryIndex(0), beatHistoryCount(0), dcLevel(2048), acAmplitude(0),
                     dynamicThreshold(2048), baselineLevel(2048), smoothedSignal(2048),
-                    smoothAlpha(0.3), peakValue(0), troughValue(4095), lastAdaptUpdate(0),
-                    signalQuality(0), spo2Value(0), spo2Quality(0) {
+                    smoothAlpha(0.12), lastGoodRaw(2048), peakValue(0), troughValue(4095), lastAdaptUpdate(0),
+                    signalQuality(0), spo2Value(0), spo2Quality(0), lastValidBPM(0), lastValidSpO2(0),
+                    rawPeakCount(0), rawPeakIndex(0), rawPeakZone(false), rawPeakZoneMax(0), rawPeakZoneMaxTime(0), bpmFromRaw(0) {
         memset(signalBuffer, 0, sizeof(signalBuffer));
         memset(beatHistory, 0, sizeof(beatHistory));
+        memset(rawPeakTimes, 0, sizeof(rawPeakTimes));
     }
     
     void begin() {
         pinMode(SEN11574_PIN, INPUT);
         analogReadResolution(12);
-        analogSetWidth(12);
+#if defined(ESP32)
         analogSetAttenuation(ADC_11db);
-        
+#endif
         delay(100);
         int sum = 0;
         int validSamples = 0;
         
         for (int i = 0; i < 50; i++) {
             int reading = analogRead(SEN11574_PIN);
-            if (reading > 0) {
+            if (reading >= 0 && reading <= MAX_SIGNAL) {
                 sum += reading;
                 validSamples++;
             }
@@ -234,14 +256,33 @@ public:
             baselineLevel = sum / validSamples;
             dcLevel = baselineLevel;
             smoothedSignal = baselineLevel;
-            dynamicThreshold = baselineLevel + 100;
+            dynamicThreshold = baselineLevel + 80;
+        } else {
+            baselineLevel = 2048;
+            dcLevel = 2048;
+            smoothedSignal = 2048;
+            dynamicThreshold = 2128;
         }
     }
     
     void update() {
         int rawSignal = analogRead(SEN11574_PIN);
         if (rawSignal < 0 || rawSignal > MAX_SIGNAL) return;
-        
+        if (rawSignal <= 50 || rawSignal >= MAX_SIGNAL - 50) {
+            rawSignal = lastGoodRaw;
+        } else {
+            lastGoodRaw = rawSignal;
+        }
+#ifdef DEBUG_SENSORS
+        if (millis() % 500 < 5) {
+            Serial.print(F("SEN11574: raw="));
+            Serial.print(rawSignal);
+            Serial.print(F(" dc="));
+            Serial.print((int)dcLevel);
+            Serial.print(F(" BPM="));
+            Serial.println(currentBPM);
+        }
+#endif
         smoothedSignal = smoothedSignal * (1.0 - smoothAlpha) + rawSignal * smoothAlpha;
         int signal = (int)smoothedSignal;
         
@@ -253,8 +294,42 @@ public:
         
         updateSignalStats();
         detectBeat(signal, millis());
+        updateBPMFromRaw(signal, millis());
         calculateSpO2();
+        if (spo2Value > 0) lastValidSpO2 = (int)spo2Value;
         updateQuality();
+    }
+    
+    void updateBPMFromRaw(int signal, unsigned long now) {
+        int thresh = (int)(dcLevel + 0.35f * (acAmplitude > 20 ? acAmplitude : 20));
+        if (signal > thresh) {
+            if (!rawPeakZone) rawPeakZone = true;
+            if (signal > rawPeakZoneMax) {
+                rawPeakZoneMax = signal;
+                rawPeakZoneMaxTime = now;
+            }
+        } else {
+            if (rawPeakZone && rawPeakZoneMaxTime > 0) {
+                rawPeakTimes[rawPeakIndex] = rawPeakZoneMaxTime;
+                rawPeakIndex = (rawPeakIndex + 1) % 8;
+                if (rawPeakCount < 8) rawPeakCount++;
+                unsigned long lastInterval = 0;
+                if (rawPeakCount >= 2) {
+                    int prev = (rawPeakIndex - 2 + 8) % 8;
+                    lastInterval = rawPeakTimes[(rawPeakIndex - 1 + 8) % 8] - rawPeakTimes[prev];
+                }
+                if (lastInterval >= 300 && lastInterval <= 2000) {
+                    int bpm = (int)(60000 / (long)lastInterval);
+                    if (bpm >= 40 && bpm <= 180) {
+                        bpmFromRaw = bpm;
+                        lastValidBPM = bpm;
+                        if (currentBPM == 0) currentBPM = bpm;
+                    }
+                }
+            }
+            rawPeakZone = false;
+            rawPeakZoneMax = 0;
+        }
     }
     
     void updateSignalStats() {
@@ -281,11 +356,20 @@ public:
             peakValue = maxVal;
             troughValue = minVal;
             
-            if (range > 50) {
-                dynamicThreshold = troughValue + (range * 0.5);
+            // More aggressive threshold positioning
+            if (range > 20) {
+                // Position threshold at 40% of the way from trough to peak
+                dynamicThreshold = troughValue + (range * 0.40);
+            } else if (range > 10) {
+                // For smaller signals, be more conservative
+                dynamicThreshold = troughValue + (range * 0.35);
             } else {
-                dynamicThreshold = dcLevel + 100;
+                // Fallback to DC-based threshold
+                dynamicThreshold = dcLevel + 50;
             }
+            
+            // Ensure threshold is reasonable
+            dynamicThreshold = constrain(dynamicThreshold, minVal + 5, maxVal - 5);
             
             lastAdaptUpdate = millis();
         }
@@ -295,16 +379,26 @@ public:
         static int lastSignal = 0;
         static bool aboveThreshold = false;
         
+        // If this is the first reading, initialize lastBeatTime
+        if (lastBeatTime == 0) {
+            lastBeatTime = now;
+            lastSignal = signal;
+            return;
+        }
+        
+        // Rising edge: signal crosses threshold from below
         if (signal > dynamicThreshold && lastSignal <= dynamicThreshold) {
             aboveThreshold = true;
         }
         
-        if (aboveThreshold && signal < dynamicThreshold) {
+        // Falling edge: signal goes back below threshold after crossing above
+        if (aboveThreshold && signal < dynamicThreshold && lastSignal >= dynamicThreshold) {
             aboveThreshold = false;
             
             unsigned long beatInterval = now - lastBeatTime;
             
-            if (beatInterval > 250 && beatInterval < 2500 && lastBeatTime > 0) {
+            // Valid beat interval: 200ms to 2500ms (24-300 BPM)
+            if (beatInterval > 200 && beatInterval < 2500) {
                 int instantBPM = 60000 / beatInterval;
                 
                 bool isValid = true;
@@ -314,12 +408,9 @@ public:
                         avgHistory += beatHistory[i];
                     }
                     avgHistory /= beatHistoryCount;
-                    
-                    if (abs(instantBPM - avgHistory) > 40) {
-                        isValid = false;
-                    }
+                    if (abs(instantBPM - avgHistory) > 50) isValid = false;
                 } else {
-                    isValid = (instantBPM >= 30 && instantBPM <= 200);
+                    isValid = (instantBPM >= 25 && instantBPM <= 220);
                 }
                 
                 if (isValid) {
@@ -332,10 +423,9 @@ public:
                         sum += beatHistory[i];
                     }
                     currentBPM = sum / beatHistoryCount;
+                    lastValidBPM = currentBPM;
                     lastBeatTime = now;
                 }
-            } else if (lastBeatTime == 0) {
-                lastBeatTime = now;
             }
         }
         
@@ -348,7 +438,7 @@ public:
     }
     
     void calculateSpO2() {
-        if (acAmplitude < 20 || dcLevel < 500) {
+        if (acAmplitude < 10 || dcLevel < 200) {
             spo2Value = 0;
             spo2Quality = 0;
             return;
@@ -357,11 +447,11 @@ public:
         float ratio = acAmplitude / dcLevel;
         spo2Value = constrain(110 - 25 * ratio, 70, 100);
         
-        if (acAmplitude > 200 && signalQuality > 60) {
+        if (acAmplitude > 150 && signalQuality > 50) {
             spo2Quality = 85;
-        } else if (acAmplitude > 100 && signalQuality > 40) {
+        } else if (acAmplitude > 80 && signalQuality > 30) {
             spo2Quality = 60;
-        } else if (acAmplitude > 50) {
+        } else if (acAmplitude > 40) {
             spo2Quality = 40;
         } else {
             spo2Quality = 20;
@@ -376,10 +466,10 @@ public:
         
         int quality = 0;
         
-        if (acAmplitude > 200) quality += 40;
-        else if (acAmplitude > 100) quality += 30;
-        else if (acAmplitude > 50) quality += 20;
-        else if (acAmplitude > 20) quality += 10;
+        if (acAmplitude > 150) quality += 40;
+        else if (acAmplitude > 80) quality += 30;
+        else if (acAmplitude > 40) quality += 20;
+        else if (acAmplitude > 15) quality += 10;
         
         unsigned long timeSinceLastBeat = millis() - lastBeatTime;
         if (timeSinceLastBeat < 1200 && currentBPM > 0) {
@@ -395,19 +485,28 @@ public:
         } else if (beatHistoryCount >= 2) {
             quality += 10;
         }
+        if (bpmFromRaw > 0 && hasPulseSignal()) quality = (quality < 45) ? 45 : quality;
         
         signalQuality = constrain(quality, 0, 100);
     }
     
-    int getBPM() {
-        unsigned long timeSince = millis() - lastBeatTime;
-        if (timeSince > 3000) return 0;
-        return constrain(currentBPM, 30, 200);
+    bool hasPulseSignal() {
+        return bufferFilled && dcLevel >= 500 && dcLevel <= 3800 && acAmplitude > 12;
     }
     
+    int getBPM() {
+        if (!hasPulseSignal()) return 0;
+        if (currentBPM > 0) return constrain(currentBPM, 25, 220);
+        if (bpmFromRaw > 0) return bpmFromRaw;
+        return lastValidBPM;
+    }
+    
+    int getLastValidBPM() { return hasPulseSignal() ? lastValidBPM : 0; }
+    
     int getSpO2() {
-        if (signalQuality < 30) return 0;
-        return (int)spo2Value;
+        if (signalQuality >= 20 && spo2Value > 0) return (int)spo2Value;
+        if (hasPulseSignal() && lastValidSpO2 > 0) return lastValidSpO2;
+        return 0;
     }
     
     int getSignalQuality() { return signalQuality; }
@@ -454,26 +553,89 @@ private:
     unsigned long lastThresholdUpdate;
     
     bool fingerDetected;
+    int lastValidBPM;
+    int lastValidSpO2;
+    
+    static const int IR_RAW_BUF = 80;
+    uint32_t irRawBuf[IR_RAW_BUF];
+    unsigned long irRawTimeBuf[IR_RAW_BUF];
+    int irRawHead;
+    int irRawLen;
+    int bpmFromRaw;
+    
+    int i2cNoDataCount;
+    unsigned long i2cLastRecoveryMs;
+    int i2cCooldownLeft;
+    
+    int computeBPMFromRaw() {
+        if (irRawLen < (int)(IR_RAW_BUF - 2)) return 0;
+        uint32_t minV = 0xFFFFFFFF, maxV = 0;
+        for (int i = 0; i < irRawLen; i++) {
+            int idx = (irRawHead + i) % IR_RAW_BUF;
+            uint32_t v = irRawBuf[idx];
+            if (v < minV) minV = v;
+            if (v > maxV) maxV = v;
+        }
+        if (maxV <= minV || (maxV - minV) < 1000) return 0;
+        uint32_t thresh = minV + (maxV - minV) / 3;
+        int peakIdx[16];
+        int nPeaks = 0;
+        for (int i = 1; i < irRawLen - 1 && nPeaks < 16; i++) {
+            int idx = (irRawHead + i) % IR_RAW_BUF;
+            int idxL = (irRawHead + i - 1) % IR_RAW_BUF;
+            int idxR = (irRawHead + i + 1) % IR_RAW_BUF;
+            uint32_t v = irRawBuf[idx];
+            if (v > thresh && v >= irRawBuf[idxL] && v >= irRawBuf[idxR])
+                peakIdx[nPeaks++] = idx;
+        }
+        if (nPeaks < 2) return 0;
+        long intervals[15];
+        int nInt = 0;
+        for (int i = 1; i < nPeaks; i++) {
+            long dt = (long)(irRawTimeBuf[peakIdx[i]] - irRawTimeBuf[peakIdx[i-1]]);
+            if (dt >= 300 && dt <= 2000) intervals[nInt++] = dt;
+        }
+        if (nInt == 0) return 0;
+        for (int i = 0; i < nInt - 1; i++)
+            for (int j = i + 1; j < nInt; j++)
+                if (intervals[j] < intervals[i]) {
+                    long t = intervals[i]; intervals[i] = intervals[j]; intervals[j] = t;
+                }
+        long medianMs = nInt % 2 ? intervals[nInt/2] : (intervals[nInt/2 - 1] + intervals[nInt/2]) / 2;
+        int bpm = (int)(60000 / medianMs);
+        if (bpm >= 40 && bpm <= 180) return bpm;
+        return 0;
+    }
     
 public:
     MAX30102Sensor(MAX30105& max) : sensor(&max), available(false), rateSpot(0),
                                     lastBeat(0), beatsPerMinute(0), beatAvg(0),
                                     irValue(0), redValue(0), irDC(0), redDC(0),
                                     irAC(0), redAC(0), spo2Value(0), spo2Quality(0),
-                                    irPeak(0), irTrough(0xFFFFFFFF), adaptiveThreshold(70000),
-                                    lastThresholdUpdate(0), fingerDetected(false) {
+                                    irPeak(0), irTrough(0xFFFFFFFF), adaptiveThreshold(25000),
+                                    lastThresholdUpdate(0), fingerDetected(false),
+                                    lastValidBPM(0), lastValidSpO2(0),
+                                    irRawHead(0), irRawLen(0), bpmFromRaw(0),
+                                    i2cNoDataCount(0), i2cLastRecoveryMs(0), i2cCooldownLeft(0) {
         memset(rates, 0, sizeof(rates));
+        memset(irRawBuf, 0, sizeof(irRawBuf));
+        memset(irRawTimeBuf, 0, sizeof(irRawTimeBuf));
     }
     
     bool begin() {
-        if (!sensor->begin(Wire, I2C_SPEED_STANDARD)) {
+        if (!sensor->begin(Wire, I2C_SPEED_STANDARD, MAX30102_I2C_ADDR)) {
             available = false;
+            uint8_t partId = sensor->readPartID();
+            Serial.println(F("MAX30102: begin() FAILED"));
+            Serial.print(F("  Part ID read: 0x"));
+            Serial.println(partId, HEX);
+            Serial.println(F("  Expected 0x15. If 0x00: no device at 0x57 (check wiring/SDA/SCL)."));
             return false;
         }
         
-        byte ledBrightness = 0x7F;
+        byte ledBrightness = 0x7F;   // 25 mA – balance: 0x5F too dim, 0xFF saturates
         byte sampleAverage = 4;
-        byte ledMode = 2;
+        byte ledMode = 2;   // Red + IR only (MAX30102 has no green)
         byte sampleRate = 100;
         int pulseWidth = 411;
         int adcRange = 4096;
@@ -482,27 +644,62 @@ public:
         sensor->setPulseAmplitudeRed(0x7F);
         sensor->setPulseAmplitudeIR(0x7F);
         sensor->setPulseAmplitudeGreen(0);
+        sensor->wakeUp();
+        sensor->clearFIFO();
         
-        delay(100);
-        for (int i = 0; i < 20; i++) {
-            uint32_t ir = sensor->getIR();
-            if (ir > 0) irDC = ir;
-            delay(50);
+        delay(300);
+        for (int i = 0; i < 30; i++) {
+            sensor->check();
+            delay(15);
         }
+        uint32_t ir = sensor->getIR();
+        if (ir > 0) irDC = ir;
         
         available = true;
+        Serial.println(F("MAX30102: init OK"));
         return true;
     }
     
     void update() {
         if (!available) return;
         
-        irValue = sensor->getIR();
-        redValue = sensor->getRed();
+        if (i2cCooldownLeft > 0) i2cCooldownLeft--;
+        int checkCount = (i2cCooldownLeft > 0) ? 2 : 5;
+        for (int i = 0; i < checkCount; i++) {
+            sensor->check();
+            delay(1);
+            esp_task_wdt_reset();
+        }
+        if (sensor->available() > 0) {
+            while (sensor->available() > 1) sensor->nextSample();
+            irValue = sensor->getFIFOIR();
+            redValue = sensor->getFIFORed();
+            sensor->nextSample();
+            i2cNoDataCount = 0;
+        } else {
+            i2cNoDataCount++;
+            if (i2cNoDataCount >= 35 && (millis() - i2cLastRecoveryMs) >= 10000) {
+                Wire.end();
+                delay(80);
+                Wire.begin(SDA_PIN, SCL_PIN);
+                Wire.setTimeOut(2000);
+                Wire.setClock(100000);
+                i2cNoDataCount = 0;
+                i2cLastRecoveryMs = millis();
+                i2cCooldownLeft = 15;
+            }
+        }
+        // When FIFO empty keep previous values; do not block on getIR()/getRed()
+        
+        bool saturated = (irValue >= MAX30102_SATURATED || redValue >= MAX30102_SATURATED);
+        if (saturated) {
+            // Don't use saturated readings for DC/AC/beat – signal is flat, BPM would stay 0
+            irValue = (irValue >= MAX30102_SATURATED && irDC > 0) ? (uint32_t)irDC : irValue;
+            redValue = (redValue >= MAX30102_SATURATED && redDC > 0) ? (uint32_t)redDC : redValue;
+        }
         
         bool wasDetected = fingerDetected;
-        // User requested revert to former settings (30000)
-        fingerDetected = (irValue > 30000); 
+        fingerDetected = (irValue > MAX30102_FINGER_THRESHOLD) && (redValue > MAX30102_FINGER_THRESHOLD_RED); 
 
         #ifdef DEBUG_SENSORS
         if (millis() % 200 == 0) {
@@ -521,12 +718,26 @@ public:
             memset(rates, 0, sizeof(rates));
             rateSpot = 0;
             beatAvg = 0;
+            irPeak = 0;
+            irTrough = 0xFFFFFFFF;
+            lastBeat = millis();
+            adaptiveThreshold = MAX30102_FINGER_THRESHOLD + 10000;
+            lastThresholdUpdate = millis();
         } else if (!fingerDetected && wasDetected) {
             reset();
             return;
         }
         
         if (!fingerDetected) return;
+        
+        if (irValue < MAX30102_SATURATED) {
+            irRawBuf[irRawHead] = irValue;
+            irRawTimeBuf[irRawHead] = millis();
+            irRawHead = (irRawHead + 1) % IR_RAW_BUF;
+            if (irRawLen < IR_RAW_BUF) irRawLen++;
+        }
+        bpmFromRaw = computeBPMFromRaw();
+        if (bpmFromRaw > 0) lastValidBPM = bpmFromRaw;
         
         const float DC_ALPHA = 0.995;
         irDC = irDC * DC_ALPHA + irValue * (1.0 - DC_ALPHA);
@@ -565,31 +776,40 @@ public:
                     if (count > 0) beatAvg = sum / count;
                 }
             }
+            if (beatAvg > 0) lastValidBPM = beatAvg;
         }
         
         calculateSpO2();
+        if (spo2Value > 0) lastValidSpO2 = spo2Value;
     }
     
     void updateThreshold() {
         if (!fingerDetected) return;
         
-        if (irValue > irPeak) irPeak = irValue;
-        if (irValue < irTrough && irValue > 30000) irTrough = irValue;
+        // Track peak and trough with better initialization
+        if (irPeak == 0 || irValue > irPeak) irPeak = irValue;
+        if (irTrough == 0xFFFFFFFF || (irValue < irTrough && irValue > MAX30102_FINGER_THRESHOLD)) {
+            irTrough = irValue;
+        }
         
-        if (millis() - lastThresholdUpdate > 1000) {
-            irPeak = irPeak * 0.95;
-            if (irTrough < irValue * 1.5) {
-                irTrough = irTrough * 1.05;
+        if (millis() - lastThresholdUpdate > 500) {
+            // Decay peak slowly, allow trough to rise
+            if (irPeak > 0) irPeak = irPeak * 0.92;
+            if (irTrough < irValue * 1.5 && irTrough != 0xFFFFFFFF) {
+                irTrough = irTrough * 1.08;
             }
             
-            if (irPeak > irTrough) {
+            // Calculate threshold based on peak/trough or DC level
+            if (irPeak > 0 && irTrough < 0xFFFFFFFF && irPeak > irTrough) {
                 uint32_t range = irPeak - irTrough;
-                adaptiveThreshold = irTrough + (range * 0.5);
+                adaptiveThreshold = irTrough + (range * 0.4);
             } else {
-                adaptiveThreshold = irDC * 1.01;
+                // Fallback: use DC-based threshold
+                adaptiveThreshold = irDC * 1.05;
             }
             
-            adaptiveThreshold = constrain(adaptiveThreshold, 40000UL, 200000UL);
+            // Keep threshold in reasonable range
+            adaptiveThreshold = constrain(adaptiveThreshold, (uint32_t)MAX30102_FINGER_THRESHOLD, (uint32_t)(irDC + 50000));
             lastThresholdUpdate = millis();
         }
     }
@@ -599,14 +819,25 @@ public:
         static bool risingEdge = false;
         static unsigned long lastBeatTime = 0;
         
+        // Initialize lastBeatTime on first call
+        if (lastBeatTime == 0) {
+            lastBeatTime = millis();
+            lastSample = sample;
+            return false;
+        }
+        
+        // Rising edge detection: signal crosses threshold from below
         if (sample > adaptiveThreshold && lastSample <= adaptiveThreshold) {
             risingEdge = true;
         }
         
-        if (risingEdge && sample < adaptiveThreshold) {
+        // Falling edge detection: confirm beat only on downward crossing
+        if (risingEdge && sample < adaptiveThreshold && lastSample >= adaptiveThreshold) {
             unsigned long now = millis();
+            unsigned long beatInterval = now - lastBeatTime;
             
-            if (now - lastBeatTime > 300) {
+            // Valid beat interval: 300ms to 2500ms (24-200 BPM)
+            if (beatInterval > 300 && beatInterval < 2500) {
                 lastBeatTime = now;
                 risingEdge = false;
                 lastSample = sample;
@@ -620,7 +851,7 @@ public:
     }
     
     void calculateSpO2() {
-        if (!fingerDetected || irDC < 30000 || redDC < 30000 || fabs(irAC) < 50) {
+        if (!fingerDetected || irDC < MAX30102_FINGER_THRESHOLD || redDC < MAX30102_FINGER_THRESHOLD || fabs(irAC) < 30) {
             spo2Value = 0;
             spo2Quality = 0;
             return;
@@ -629,13 +860,13 @@ public:
         float ratioRMS = (fabs(redAC) / redDC) / (fabs(irAC) / irDC);
         spo2Value = constrain((int)(110 - 25 * ratioRMS), 70, 100);
         
-        if (irValue > 120000 && beatAvg > 0) {
+        if (irValue > 80000 && beatAvg > 0) {
             spo2Quality = 95;
-        } else if (irValue > 90000 && beatAvg > 0) {
+        } else if (irValue > 50000 && beatAvg > 0) {
             spo2Quality = 80;
-        } else if (irValue > 60000) {
-            spo2Quality = 60;
         } else if (irValue > 30000) {
+            spo2Quality = 60;
+        } else if (irValue > MAX30102_FINGER_THRESHOLD) {
             spo2Quality = 40;
         } else {
             spo2Quality = 20;
@@ -643,29 +874,41 @@ public:
     }
     
     int getBPM() {
-        if (!available || !fingerDetected || millis() - lastBeat > 3000) return 0;
-        return beatAvg;
+        if (!available || !fingerDetected) return 0;
+        if (millis() - lastBeat <= 3000 && beatAvg > 0) return beatAvg;
+        if (bpmFromRaw > 0) return bpmFromRaw;
+        return lastValidBPM;
     }
     
+    int getLastValidBPM() { return fingerDetected ? lastValidBPM : 0; }
+    
     int getSpO2() {
-        if (!available || !fingerDetected) return 0;
-        return spo2Value;
+        if (available && fingerDetected && spo2Value > 0) return spo2Value;
+        if (lastValidSpO2 > 0) return lastValidSpO2;
+        return 0;
     }
     
     int getHRQuality() {
-        if (!available || !fingerDetected) return 0;
-        
+        if (!available || !fingerDetected) {
+            if (lastValidBPM > 0) return 25;
+            return 0;
+        }
+        if (bpmFromRaw > 0) return 45;
         unsigned long timeSinceBeat = millis() - lastBeat;
-        
-        if (irValue > 100000 && beatAvg > 0 && timeSinceBeat < 1200) return 95;
-        else if (irValue > 80000 && beatAvg > 0 && timeSinceBeat < 2000) return 75;
-        else if (irValue > 50000 && timeSinceBeat < 3000) return 50;
-        else if (irValue > 30000) return 30;
+        if (irValue > 80000 && beatAvg > 0 && timeSinceBeat < 1200) return 95;
+        else if (irValue > 50000 && beatAvg > 0 && timeSinceBeat < 2000) return 75;
+        else if (irValue > 30000 && timeSinceBeat < 3000) return 50;
+        else if (irValue > MAX30102_FINGER_THRESHOLD) return 30;
+        if (lastValidBPM > 0) return 25;
         return 20;
     }
     
     int getSpO2Quality() {
-        if (!available || !fingerDetected) return 0;
+        if (!available || !fingerDetected) {
+            if (lastValidSpO2 > 0) return 25;
+            return 0;
+        }
+        if (lastValidSpO2 > 0 && spo2Value == 0) return 25;
         return spo2Quality;
     }
     
@@ -947,6 +1190,10 @@ void updateLCD() {
 
 // ==================== VITALS UPDATE ====================
 void updateVitals() {
+    static int lastReportedBPM = 0;
+    static unsigned long lastReportedBPMTime = 0;
+    const unsigned long BPM_HOLD_MS = 15000;
+    
     int max30102_hr = max30102Sensor.getBPM();
     int max30102_spo2 = max30102Sensor.getSpO2();
     int max30102_hrQuality = max30102Sensor.getHRQuality();
@@ -957,22 +1204,53 @@ void updateVitals() {
     int sen11574_hrQuality = pulseSensor.getSignalQuality();
     int sen11574_spo2Quality = pulseSensor.getSpO2Quality();
     
-    // --- HEART RATE PRIORITY: MAX30102 (Primary) with Failover to SEN11574 ---
-    // User requested to prioritize MAX30102. Use SEN11574 only if MAX30102 is 0.
-    if (max30102_hr > 0 && max30102_hrQuality >= MIN_QUALITY_THRESHOLD) {
+    bool fingerOnMax = max30102Sensor.isFingerDetected();
+    
+    if (!fingerOnMax) {
+        currentVitals.heartRate = 0;
+        currentVitals.hrQuality = 0;
+        currentVitals.hrSource = "NONE";
+        lastReportedBPM = 0;
+    }
+    else if (max30102_hr > 0 && max30102_hrQuality >= MIN_QUALITY_THRESHOLD) {
         currentVitals.heartRate = max30102_hr;
         currentVitals.hrQuality = max30102_hrQuality;
         currentVitals.hrSource = "MAX30102";
-    } 
+        lastReportedBPM = max30102_hr;
+        lastReportedBPMTime = millis();
+    }
     else if (sen11574_hr > 0 && sen11574_hrQuality >= MIN_QUALITY_THRESHOLD) {
         currentVitals.heartRate = sen11574_hr;
         currentVitals.hrQuality = sen11574_hrQuality;
         currentVitals.hrSource = "SEN11574";
-    } 
+        lastReportedBPM = sen11574_hr;
+        lastReportedBPMTime = millis();
+    }
     else {
-        currentVitals.heartRate = 0;
-        currentVitals.hrQuality = 0;
-        currentVitals.hrSource = "NONE";
+        int lastMax = max30102Sensor.getLastValidBPM();
+        int lastSen = pulseSensor.getLastValidBPM();
+        int fusedBPM = 0;
+        if (lastMax > 0 && lastSen > 0)
+            fusedBPM = (lastMax + lastSen) / 2;
+        else if (lastMax > 0)
+            fusedBPM = lastMax;
+        else if (lastSen > 0)
+            fusedBPM = lastSen;
+        if (fusedBPM > 0) {
+            currentVitals.heartRate = fusedBPM;
+            currentVitals.hrQuality = 25;
+            currentVitals.hrSource = (lastMax > 0 && lastSen > 0) ? "Fused" : "Held";
+            lastReportedBPM = fusedBPM;
+            lastReportedBPMTime = millis();
+        } else if (lastReportedBPM > 0 && (millis() - lastReportedBPMTime) < BPM_HOLD_MS) {
+            currentVitals.heartRate = lastReportedBPM;
+            currentVitals.hrQuality = 25;
+            currentVitals.hrSource = "Held";
+        } else {
+            currentVitals.heartRate = 0;
+            currentVitals.hrQuality = 0;
+            currentVitals.hrSource = "NONE";
+        }
     }
     
     // --- SpO2 PRIORITY: MAX30102 ---
@@ -1207,7 +1485,7 @@ void setup() {
     pinMode(SEN11574_PIN, INPUT);
     
     Wire.begin(SDA_PIN, SCL_PIN);
-    // Wire.setClock(400000); // Reverted to default 100kHz per user request
+    Wire.setTimeOut(2000);
     lcd.init();
     lcd.backlight();
     lcd.clear();
@@ -1225,6 +1503,9 @@ void setup() {
     tempSensor.begin();
     
     delay(100);
+    Wire.begin(SDA_PIN, SCL_PIN);
+    Wire.setClock(100000);
+    delay(50);
     max30102Sensor.begin();
     pulseSensor.begin();
     
@@ -1281,23 +1562,26 @@ void loop() {
     
     if (monitoringState == STATE_MONITORING) {
         max30102Sensor.update();
-        
         if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
             pulseSensor.update();
             lastSensorRead = millis();
         }
-        
         if (millis() - lastVitalUpdate >= VITALS_UPDATE_INTERVAL) {
             updateVitals();
             checkAlerts();
             lastVitalUpdate = millis();
         }
-        
         if (millis() - lastCloudSync >= CLOUD_SYNC_INTERVAL) {
             if (WiFi.status() == WL_CONNECTED) {
                 sendToCloud();
             }
             lastCloudSync = millis();
+        }
+    } else {
+        static unsigned long lastPulseIdle = 0;
+        if (millis() - lastPulseIdle >= 20) {
+            pulseSensor.update();
+            lastPulseIdle = millis();
         }
     }
     
