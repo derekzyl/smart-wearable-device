@@ -101,24 +101,7 @@ uvicorn main:app --reload
 |-----------|----------|---------|
 | ESP32-S3-WROOM-1 | 1 | Main microcontroller (Wi-Fi/BLE 5.0) |
 | MAX30102 | 1 | PPG sensor (heart rate, SpO₂) |
-| MPU6050 | 1 | 6-axis IMU (accelerometer + gyroscope) |
-| MAX30205 | 1 | Digital temperature sensor |
-| SSD1306 OLED (128×64) | 1 | Display module |
-| TP4056 Charger | 1 | Li-ion battery charging |
-| Li-Po 3.7V 500mAh | 1 | Power supply |
-
-### Circuit Components
-- **Capacitors**: 0.1µF (decoupling), 1µF, 10µF, 22µF (filtering)
-- **Resistors**: 10kΩ (I²C pull-ups), 1kΩ (LED limiting)
-- **Diodes**: 1N5819 (reverse protection)
-- **LEDs**: Red (charging), Green/Blue (status)
-
-See [Hardware Component List](#hardware-components) for complete BOM.
-
-## 📊 Power Consumption
-
-| Mode | Current Draw | Battery Life (500mAh) |
-|------|--------------|----------------------|
+---------------|
 | Active monitoring | ~80mA | 6-7 hours |
 | Display on | +15mA | 5 hours |
 | Deep sleep | ~500µA avg | 40+ days |
